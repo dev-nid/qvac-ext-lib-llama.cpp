@@ -216,7 +216,7 @@ class vk_memory_logger;
 class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
 
-static constexpr uint32_t mul_mat_vec_max_cols = 8;
+static constexpr uint32_t mul_mat_vec_max_cols = 16;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
 enum vk_device_architecture {
