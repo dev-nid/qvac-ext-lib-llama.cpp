@@ -1664,6 +1664,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_MAIN}));
     add_opt(common_arg(
+        {"--bench"}, "N",
+        string_format("repeat the full generation N times and report aggregate throughput (default: %d)", params.bench_runs),
+        [](common_params & params, int value) {
+            params.bench_runs = std::max(1, value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_MAIN}));
+    add_opt(common_arg(
         {"--prompt-cache"}, "FNAME",
         "file to cache prompt state for faster startup (default: none)",
         [](common_params & params, const std::string & value) {

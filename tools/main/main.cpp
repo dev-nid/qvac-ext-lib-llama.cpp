@@ -11,10 +11,14 @@
 #include <ctime>
 #include <fstream>
 #include <iostream>
-#include <sstream>
-#include <string>
-#include <vector>
-
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
 #include <unistd.h>
@@ -40,6 +44,69 @@ static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
 static bool is_interacting  = false;
 static bool need_insert_eot = false;
+
+struct cli_buffer_capture {
+    double model_buffer_mib = 0.0;
+    double cpu_mapped_buffer_mib = 0.0;
+};
+
+struct cli_log_capture_state {
+    cli_buffer_capture * active = nullptr;
+};
+
+static cli_log_capture_state g_log_capture_state;
+
+struct cli_perf_metrics {
+    int64_t prefill_start_us = 0;
+    int64_t first_token_us = 0;
+    int64_t end_us = 0;
+    int32_t prompt_tokens = 0;
+    int32_t max_kv_tokens = 0;
+    bool have_first_token = false;
+};
+
+struct cli_run_summary {
+    double  prompt_time_s = 0.0;
+    double  prompt_speed_tps = 0.0;
+    double  generation_time_s = 0.0;
+    double  generation_speed_tps = 0.0;
+    double  total_time_s = 0.0;
+    double  total_speed_tps = 0.0;
+    double  ttft_s = 0.0;
+    int32_t prompt_tokens = 0;
+    int32_t generation_tokens = 0;
+    int32_t total_tokens = 0;
+    int32_t required_kv_tokens = 0;
+    double  model_buffer_mib = 0.0;
+    double  cpu_buffer_mib = 0.0;
+};
+
+static void print_bench_table(const std::vector<cli_run_summary> & summaries);
+
+static void cli_llama_log_callback(ggml_log_level level, const char * text, void * user_data) {
+    auto * state = static_cast<cli_log_capture_state *>(user_data);
+
+    if (state != nullptr && state->active != nullptr && text != nullptr) {
+        if (strstr(text, "model buffer size") != nullptr) {
+            double value_mib = 0.0;
+            if (sscanf(text, "%*[^=]= %lf MiB", &value_mib) == 1) {
+                if (strstr(text, "CPU_Mapped") != nullptr) {
+                    state->active->cpu_mapped_buffer_mib = value_mib;
+                } else {
+                    state->active->model_buffer_mib = value_mib;
+                }
+            }
+        }
+    }
+
+    if (text == nullptr) {
+        return;
+    }
+
+    if (LOG_DEFAULT_LLAMA <= common_log_verbosity_thold) {
+        common_log_add(common_log_main(), level, "%s", text);
+    }
+}
 
 static void print_usage(int argc, char ** argv) {
     (void) argc;
@@ -92,12 +159,36 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    auto & sparams = params.sampling;
+    llama_log_set(cli_llama_log_callback, &g_log_capture_state);
+
+    const int bench_runs = std::max(1, params.bench_runs);
+    params.bench_runs = bench_runs;
+
+    std::vector<cli_run_summary> bench_summaries;
+    bench_summaries.reserve(bench_runs);
+
+    const common_params params_base = params;
 
     // save choice to use color for later
     // (note for later: this is a slightly awkward choice)
     console::init(params.simple_io, params.use_color);
     atexit([]() { console::cleanup(); });
+
+    for (int bench_iter = 0; bench_iter < bench_runs; ++bench_iter) {
+        if (bench_iter > 0) {
+            params = params_base;
+        }
+
+        g_params = &params;
+
+        is_interacting  = false;
+        need_insert_eot = false;
+
+        auto & sparams = params.sampling;
+
+        if (bench_runs > 1) {
+            LOG_INF("\n=== bench run %d/%d ===\n", bench_iter + 1, bench_runs);
+        }
 
     if (params.embedding) {
         LOG_ERR("************\n");
@@ -134,6 +225,9 @@ int main(int argc, char ** argv) {
     g_smpl = &smpl;
 
     std::vector<common_chat_msg> chat_msgs;
+
+    cli_buffer_capture buffer_capture;
+    g_log_capture_state.active = &buffer_capture;
 
     // load the model and apply lora adapter, if any
     LOG_INF("%s: load the model and apply lora adapter, if any\n", __func__);
@@ -263,6 +357,8 @@ int main(int argc, char ** argv) {
     LOG_DBG("n_ctx: %d, add_bos: %d\n", n_ctx, add_bos);
 
     std::vector<llama_token> embd_inp;
+
+    cli_perf_metrics perf_cli;
 
     bool waiting_for_first_input = false;
     auto chat_add_and_format = [&chat_msgs, &chat_templates](const std::string & role, const std::string & content) {
@@ -562,9 +658,13 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
+    perf_cli.prefill_start_us = ggml_time_us();
+
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
         if (!embd.empty()) {
+            perf_cli.max_kv_tokens = std::max(perf_cli.max_kv_tokens, n_past + (int) embd.size());
+
             // Note: (n_ctx - 4) here is to match the logic for commandline prompt handling via
             // --prompt or --file which uses the same value.
             int max_embd_size = n_ctx - 4;
@@ -674,6 +774,7 @@ int main(int argc, char ** argv) {
                 }
 
                 n_past += n_eval;
+                perf_cli.max_kv_tokens = std::max(perf_cli.max_kv_tokens, n_past);
 
                 LOG_DBG("n_past = %d\n", n_past);
                 // Display total tokens alongside total time
@@ -703,9 +804,13 @@ int main(int argc, char ** argv) {
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
 
-            // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
-
             embd.push_back(id);
+
+            if (!perf_cli.have_first_token) {
+                perf_cli.have_first_token = true;
+                perf_cli.first_token_us = ggml_time_us();
+                perf_cli.prompt_tokens = n_past;
+            }
 
             // echo this to console
             input_echo = true;
@@ -973,6 +1078,8 @@ int main(int argc, char ** argv) {
         }
     }
 
+    perf_cli.end_us = ggml_time_us();
+
     if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
         LOG("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
         llama_state_save_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
@@ -981,12 +1088,202 @@ int main(int argc, char ** argv) {
     LOG("\n\n");
     common_perf_print(ctx, smpl);
 
+    const auto perf_ctx = llama_perf_context(ctx);
+
+    const double prompt_time_s = perf_ctx.n_p_eval > 0 ? perf_ctx.t_p_eval_ms / 1000.0 : 0.0;
+    const double prompt_speed = prompt_time_s > 0.0 ? perf_ctx.n_p_eval / prompt_time_s : 0.0;
+
+    const double generation_time_s = perf_ctx.n_eval > 0 ? perf_ctx.t_eval_ms / 1000.0 : 0.0;
+    const double generation_speed = generation_time_s > 0.0 ? perf_ctx.n_eval / generation_time_s : 0.0;
+
+    const int total_tokens = perf_ctx.n_p_eval + perf_ctx.n_eval;
+    const double t_end_ms = 1e-3 * (perf_cli.end_us ? perf_cli.end_us : ggml_time_us());
+    const double total_time_s = total_tokens > 0 ? (t_end_ms - perf_ctx.t_start_ms) / 1000.0 : 0.0;
+    const double total_speed = total_time_s > 0.0 ? total_tokens / total_time_s : 0.0;
+
+    const double ttft_s = perf_cli.have_first_token
+        ? (perf_cli.first_token_us - perf_cli.prefill_start_us) / 1e6
+        : prompt_time_s;
+
+    const int32_t required_kv_tokens = perf_cli.max_kv_tokens > 0 ? perf_cli.max_kv_tokens : total_tokens;
+    const size_t generated_tokens = output_tokens.size();
+
+    cli_run_summary summary;
+    summary.prompt_time_s = prompt_time_s;
+    summary.prompt_speed_tps = prompt_speed;
+    summary.generation_time_s = generation_time_s;
+    summary.generation_speed_tps = generation_speed;
+    summary.total_time_s = total_time_s;
+    summary.total_speed_tps = total_speed;
+    summary.ttft_s = ttft_s;
+    summary.prompt_tokens = perf_ctx.n_p_eval;
+    summary.generation_tokens = perf_ctx.n_eval;
+    summary.total_tokens = total_tokens;
+    summary.required_kv_tokens = required_kv_tokens;
+    summary.model_buffer_mib = buffer_capture.model_buffer_mib;
+    summary.cpu_buffer_mib = buffer_capture.cpu_mapped_buffer_mib;
+
+    bench_summaries.push_back(summary);
+
+    g_log_capture_state.active = nullptr;
+
+    if (bench_runs > 1) {
+        LOG_INF("performance summary (run %d/%d):\n", bench_iter + 1, bench_runs);
+    } else {
+        LOG_INF("performance summary:\n");
+    }
+    LOG_INF("  required KV cache size (tokens): %d / %d\n", required_kv_tokens, llama_n_ctx(ctx));
+
+    if (perf_ctx.n_p_eval > 0) {
+        LOG_INF("  prompt processing time (time to first token): %.3f s (%d tokens @ %.2f t/s)\n",
+                prompt_time_s, perf_ctx.n_p_eval, prompt_speed);
+    }
+
+    if (generated_tokens > 0 && perf_ctx.n_eval > 0) {
+        LOG_INF("  generation time: %.3f s (%d tokens @ %.2f t/s)\n",
+                generation_time_s, perf_ctx.n_eval, generation_speed);
+    }
+
+    if (total_tokens > 0) {
+        LOG_INF("  total run time: %.3f s (%d tokens @ %.2f t/s)\n",
+                total_time_s, total_tokens, total_speed);
+    }
+
+    if (perf_cli.have_first_token) {
+        LOG_INF("  observed time to first token: %.3f s\n", ttft_s);
+    }
+
+    LOG_INF("  generated tokens: %zu\n", generated_tokens);
+    if (summary.model_buffer_mib > 0.0 || summary.cpu_buffer_mib > 0.0) {
+        LOG_INF("  model buffer size: %.2f MiB\n", summary.model_buffer_mib);
+        LOG_INF("  CPU-mapped model buffer size: %.2f MiB\n", summary.cpu_buffer_mib);
+    }
+
     common_sampler_free(smpl);
 
     llama_backend_free();
 
     ggml_threadpool_free_fn(threadpool);
     ggml_threadpool_free_fn(threadpool_batch);
+    }
+
+    if (bench_runs > 1) {
+        print_bench_table(bench_summaries);
+    }
 
     return 0;
+}
+
+static void print_bench_table(const std::vector<cli_run_summary> & summaries) {
+    if (summaries.empty()) {
+        return;
+    }
+
+    double sum_tokens = 0.0;
+    int32_t min_tokens = std::numeric_limits<int32_t>::max();
+    int32_t max_tokens = std::numeric_limits<int32_t>::min();
+
+    double sum_ttft = 0.0;
+    double min_ttft = std::numeric_limits<double>::infinity();
+    double max_ttft = 0.0;
+
+    double sum_prompt_speed = 0.0;
+    double min_prompt_speed = std::numeric_limits<double>::infinity();
+    double max_prompt_speed = 0.0;
+
+    double sum_gen_speed = 0.0;
+    double min_gen_speed = std::numeric_limits<double>::infinity();
+    double max_gen_speed = 0.0;
+
+    double sum_total_speed = 0.0;
+    double min_total_speed = std::numeric_limits<double>::infinity();
+    double max_total_speed = 0.0;
+
+    double sum_model_buf = 0.0;
+    double min_model_buf = std::numeric_limits<double>::infinity();
+    double max_model_buf = 0.0;
+
+    double sum_cpu_buf = 0.0;
+    double min_cpu_buf = std::numeric_limits<double>::infinity();
+    double max_cpu_buf = 0.0;
+
+    LOG_INF("\nbench summary (total tokens per second):\n");
+    LOG_INF("| %4s | %10s | %10s | %12s | %12s | %12s | %15s | %15s |\n",
+        "Run", "Tokens", "TTFT s", "Prompt t/s", "Gen t/s", "Total t/s", "Model buf MiB", "CPU buf MiB");
+    LOG_INF("|-%4s-|-%10s-|-%10s-|-%12s-|-%12s-|-%12s-|-%15s-|-%15s-|\n",
+        "----", "----------", "----------", "------------", "------------", "------------", "---------------", "---------------");
+
+    for (size_t i = 0; i < summaries.size(); ++i) {
+        const auto & run = summaries[i];
+        LOG_INF("| %4zu | %10d | %10.3f | %12.2f | %12.2f | %12.2f | %15.2f | %15.2f |\n",
+            i + 1,
+            run.total_tokens,
+            run.ttft_s,
+            run.prompt_speed_tps,
+            run.generation_speed_tps,
+            run.total_speed_tps,
+            run.model_buffer_mib,
+            run.cpu_buffer_mib);
+
+            sum_tokens += run.total_tokens;
+            min_tokens = std::min(min_tokens, run.total_tokens);
+            max_tokens = std::max(max_tokens, run.total_tokens);
+
+            sum_ttft += run.ttft_s;
+            min_ttft = std::min(min_ttft, run.ttft_s);
+            max_ttft = std::max(max_ttft, run.ttft_s);
+
+            sum_prompt_speed += run.prompt_speed_tps;
+            min_prompt_speed = std::min(min_prompt_speed, run.prompt_speed_tps);
+            max_prompt_speed = std::max(max_prompt_speed, run.prompt_speed_tps);
+
+            sum_gen_speed += run.generation_speed_tps;
+            min_gen_speed = std::min(min_gen_speed, run.generation_speed_tps);
+            max_gen_speed = std::max(max_gen_speed, run.generation_speed_tps);
+
+            sum_total_speed += run.total_speed_tps;
+            min_total_speed = std::min(min_total_speed, run.total_speed_tps);
+            max_total_speed = std::max(max_total_speed, run.total_speed_tps);
+
+        if (run.model_buffer_mib > 0.0) {
+            sum_model_buf += run.model_buffer_mib;
+            min_model_buf = std::min(min_model_buf, run.model_buffer_mib);
+            max_model_buf = std::max(max_model_buf, run.model_buffer_mib);
+        }
+
+        if (run.cpu_buffer_mib > 0.0) {
+            sum_cpu_buf += run.cpu_buffer_mib;
+            min_cpu_buf = std::min(min_cpu_buf, run.cpu_buffer_mib);
+            max_cpu_buf = std::max(max_cpu_buf, run.cpu_buffer_mib);
+        }
+    }
+
+    const double denom = static_cast<double>(summaries.size());
+
+    const double avg_tokens = sum_tokens / denom;
+    const double avg_ttft = sum_ttft / denom;
+    const double avg_prompt_speed = sum_prompt_speed / denom;
+    const double avg_gen_speed = sum_gen_speed / denom;
+    const double avg_total_speed = sum_total_speed / denom;
+
+    const bool have_model_buf = sum_model_buf > 0.0;
+    const bool have_cpu_buf = sum_cpu_buf > 0.0;
+
+    const double avg_model_buf = have_model_buf ? (sum_model_buf / denom) : 0.0;
+    const double avg_cpu_buf = have_cpu_buf ? (sum_cpu_buf / denom) : 0.0;
+
+    const double min_model_buf_out = have_model_buf ? min_model_buf : 0.0;
+    const double max_model_buf_out = have_model_buf ? max_model_buf : 0.0;
+    const double min_cpu_buf_out = have_cpu_buf ? min_cpu_buf : 0.0;
+    const double max_cpu_buf_out = have_cpu_buf ? max_cpu_buf : 0.0;
+
+    LOG_INF("| %4s | %10.0f | %10.3f | %12.2f | %12.2f | %12.2f | %15.2f | %15.2f |\n",
+        "avg", avg_tokens, avg_ttft, avg_prompt_speed, avg_gen_speed, avg_total_speed,
+        avg_model_buf, avg_cpu_buf);
+    LOG_INF("| %4s | %10d | %10.3f | %12.2f | %12.2f | %12.2f | %15.2f | %15.2f |\n",
+        "low", min_tokens, min_ttft, min_prompt_speed, min_gen_speed, min_total_speed,
+        min_model_buf_out, min_cpu_buf_out);
+    LOG_INF("| %4s | %10d | %10.3f | %12.2f | %12.2f | %12.2f | %15.2f | %15.2f |\n",
+        "high", max_tokens, max_ttft, max_prompt_speed, max_gen_speed, max_total_speed,
+        max_model_buf_out, max_cpu_buf_out);
 }
