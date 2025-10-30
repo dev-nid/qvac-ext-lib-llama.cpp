@@ -11791,11 +11791,21 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
 
-        if (almost_ready && !ctx->almost_ready_fence_pending && !use_fence) {
-            ggml_vk_submit(subctx, ctx->almost_ready_fence);
-            ctx->almost_ready_fence_pending = true;
-        } else {
-            ggml_vk_submit(subctx, use_fence ? ctx->fence : vk::Fence{});
+        try {
+            if (almost_ready && !ctx->almost_ready_fence_pending && !use_fence) {
+                ggml_vk_submit(subctx, ctx->almost_ready_fence);
+                ctx->almost_ready_fence_pending = true;
+            } else {
+                    ggml_vk_submit(subctx, use_fence ? ctx->fence : vk::Fence{});
+            }
+        } catch (const vk::DeviceLostError& e) {
+            std::stringstream ss;
+            ss << "Failed to submit queue for tensor " << tensor->name
+               << " OP " << ggml_op_name(tensor->op) << ": " << e.what();
+            throw std::runtime_error(ss.str());
+        } catch (const vk::SystemError& e) {
+            GGML_LOG_ERROR("Failed to submit queue for tensor %s OP %s (%s)", tensor->name,
+                           ggml_op_name(tensor->op), e.what());
         }
 
         if (use_fence) {
@@ -12469,7 +12479,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (i + ctx->num_additional_fused_ops == last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
-        bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, false, i + ctx->num_additional_fused_ops == last_node, almost_ready, submit);
+        bool enqueued = false;
+
+        try {
+            enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx],
+                                           submit_node_idx, false,
+                                           i + ctx->num_additional_fused_ops == last_node,
+                                           almost_ready, submit);
+        } catch (const std::runtime_error& e) {
+            ggml_vk_graph_cleanup(ctx);
+            GGML_LOG_ERROR("Failed to build graph: %s", e.what());
+            return GGML_STATUS_FAILED;
+        }
 
         if (vk_perf_logger_enabled) {
             if (ctx->compute_ctx.expired()) {
