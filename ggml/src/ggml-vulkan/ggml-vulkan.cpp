@@ -12742,7 +12742,15 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
     }
 
-    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    // Align pointer to TENSOR_ALIGNMENT (32 bytes) as required by ggml_backend_cpu_buffer_from_ptr
+    // VMA's pMappedData may not be 32-byte aligned
+    uintptr_t ptr_uint = (uintptr_t)ptr;
+    uintptr_t aligned_ptr_uint = GGML_PAD(ptr_uint, TENSOR_ALIGNMENT);
+    size_t alignment_offset = aligned_ptr_uint - ptr_uint;
+    void * aligned_ptr = (void *)aligned_ptr_uint;
+    size_t aligned_size = size - alignment_offset;
+
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(aligned_ptr, aligned_size);
     buffer->buft = buft;
     buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
 
