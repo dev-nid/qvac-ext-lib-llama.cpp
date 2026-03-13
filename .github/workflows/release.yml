@@ -345,7 +345,7 @@ jobs:
           - backend: 'vulkan'
             arch: 'x64'
             defines: '-DGGML_VULKAN=ON'
-            target: 'ggml-vulkan'
+            target: 'qvac-ggml-vulkan'
 
     steps:
       - name: Clone
