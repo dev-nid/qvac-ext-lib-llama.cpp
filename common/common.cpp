@@ -1909,7 +1909,7 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
                 while (true) {
                     size_t open = render.find(GEMMA_START, from);
                     if (open == std::string::npos) break;
-                    size_t lo = open;
+                    size_t lo = open + GEMMA_START.size();
                     size_t close = render.find(GEMMA_END, lo);
                     if (close == std::string::npos) {
                         assistant_spans.push_back({lo, render.size()});
@@ -1930,8 +1930,8 @@ ggml_opt_dataset_t common_opt_sft_dataset_init(
                     size_t open = render.find(START_AST, from);
                     if (open == std::string::npos) break;
 
-                    // Include the role token ("assistant") and everything through the closing tag/newlines
-                    size_t lo = open + START_TAG.size();
+                    // Skip past the full role header so only content tokens are supervised
+                    size_t lo = open + START_AST.size();
                     if (lo > render.size()) {
                         lo = render.size();
                     }
