@@ -295,11 +295,11 @@ endif()
 
 if (LLAMA_MTMD AND TARGET mtmd)
 
-    install(
+  install(
     TARGETS mtmd
     EXPORT llama-targets
     PUBLIC_HEADER
-        DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/mtmd)
+      DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}/mtmd)
 
 endif()
 
