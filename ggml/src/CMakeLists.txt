@@ -315,6 +315,10 @@ if (GGML_VECTOR_INDEX)
     )
 
     target_link_libraries(ggml-vector-index PRIVATE Threads::Threads)
+    if (APPLE AND GGML_ACCELERATE)
+        target_compile_definitions(ggml-vector-index PRIVATE GGML_USE_ACCELERATE ACCELERATE_NEW_LAPACK)
+        target_link_libraries(ggml-vector-index PRIVATE "-framework Accelerate")
+    endif()
 endif()
 
 function(ggml_add_backend_library backend)
