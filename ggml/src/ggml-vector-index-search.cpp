@@ -63,14 +63,6 @@ inline float dot_q4_scalar(const float * query, const uint8_t * codes, float sca
     return float_score_from_double(acc);
 }
 
-inline double query_max_abs(const float * query, int dim) {
-    double max_query = 0.0;
-    for (int i = 0; i < dim; ++i) {
-        max_query = std::max(max_query, std::fabs(static_cast<double>(query[i])));
-    }
-    return max_query;
-}
-
 inline bool quantized_dot_float_path_is_safe(
         double max_query,
         int dim,
@@ -78,6 +70,36 @@ inline bool quantized_dot_float_path_is_safe(
         float max_code) {
     const double max_value = static_cast<double>(max_code) * static_cast<double>(scale);
     return static_cast<double>(dim) * max_query * max_value <= static_cast<double>(FLT_MAX);
+}
+
+bool validate_queries_and_maybe_max_abs(
+        const float * queries,
+        int n_q,
+        int dim,
+        bool compute_max_abs,
+        std::vector<double> & query_max_abs_values) {
+    query_max_abs_values.clear();
+    if (compute_max_abs) {
+        query_max_abs_values.resize(static_cast<size_t>(n_q));
+    }
+    const size_t dim_sz = static_cast<size_t>(dim);
+    for (int q = 0; q < n_q; ++q) {
+        const float * query = queries + static_cast<size_t>(q) * dim_sz;
+        double max_query = 0.0;
+        for (int i = 0; i < dim; ++i) {
+            const float value = query[i];
+            if (!std::isfinite(value)) {
+                return false;
+            }
+            if (compute_max_abs) {
+                max_query = std::max(max_query, std::fabs(static_cast<double>(value)));
+            }
+        }
+        if (compute_max_abs) {
+            query_max_abs_values[static_cast<size_t>(q)] = max_query;
+        }
+    }
+    return true;
 }
 
 #if GGML_VEC_INDEX_USE_NEON
@@ -316,6 +338,7 @@ void search_one(
     int                      k,
     float                  * out_scores,
     uint64_t               * out_ids,
+    double                   max_query,
     std::vector<ScoreId>   & heap,
     std::vector<ScoreId>   & drained,
     const std::vector<size_t> * allowed_slots = nullptr) {
@@ -331,7 +354,6 @@ void search_one(
     const size_t heap_capacity =
         std::min(static_cast<size_t>(k), candidate_hint);
     heap.reserve(heap_capacity);
-    const double max_query = is_quantized(idx) ? query_max_abs(query, idx.dim) : 0.0;
 
     auto visit_slot = [&](size_t slot) {
         if (!slot_is_active(idx, slot)) {
@@ -537,7 +559,9 @@ static int ggml_vec_index_search_impl(
             n_q_sz > std::numeric_limits<size_t>::max() / k_sz) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        if (!all_finite(queries, n_q_sz * dim_sz)) {
+        std::vector<double> query_max_abs_values;
+        if (!validate_queries_and_maybe_max_abs(
+                queries, n_q, dim, is_quantized(*idx), query_max_abs_values)) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
@@ -560,12 +584,15 @@ static int ggml_vec_index_search_impl(
         std::vector<ScoreId> heap;
         std::vector<ScoreId> drained;
         for (int q = 0; q < n_q; ++q) {
+            const double max_query = query_max_abs_values.empty() ?
+                0.0 : query_max_abs_values[static_cast<size_t>(q)];
             search_one(
                 *idx,
                 queries + static_cast<size_t>(q) * static_cast<size_t>(dim),
                 k,
                 out_scores + static_cast<size_t>(q) * static_cast<size_t>(k),
                 out_ids    + static_cast<size_t>(q) * static_cast<size_t>(k),
+                max_query,
                 heap,
                 drained,
                 allowed_ptr);
@@ -678,7 +705,9 @@ int ggml_vec_index_search_ivf(
             n_q_sz > std::numeric_limits<size_t>::max() / k_sz) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        if (!all_finite(queries, n_q_sz * dim_sz)) {
+        std::vector<double> query_max_abs_values;
+        if (!validate_queries_and_maybe_max_abs(
+                queries, n_q, dim, is_quantized(*idx), query_max_abs_values)) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         if (idx->ivf_generation != idx->generation ||
@@ -700,10 +729,12 @@ int ggml_vec_index_search_ivf(
             const float * query = queries + static_cast<size_t>(q) * dim_sz;
             float * scores = out_scores + static_cast<size_t>(q) * k_sz;
             uint64_t * ids = out_ids + static_cast<size_t>(q) * k_sz;
+            const double max_query = query_max_abs_values.empty() ?
+                0.0 : query_max_abs_values[static_cast<size_t>(q)];
 
             if (idx->ivf_n_lists == 0) {
                 const std::vector<size_t> empty_slots;
-                search_one(*idx, query, k, scores, ids, heap, drained, &empty_slots);
+                search_one(*idx, query, k, scores, ids, max_query, heap, drained, &empty_slots);
                 continue;
             }
 
@@ -742,7 +773,7 @@ int ggml_vec_index_search_ivf(
                 const auto & list = idx->ivf_lists[list_id];
                 candidate_slots.insert(candidate_slots.end(), list.begin(), list.end());
             }
-            search_one(*idx, query, k, scores, ids, heap, drained, &candidate_slots);
+            search_one(*idx, query, k, scores, ids, max_query, heap, drained, &candidate_slots);
         }
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
