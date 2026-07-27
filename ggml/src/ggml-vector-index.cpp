@@ -133,6 +133,12 @@ private:
 void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale) {
     const ScopedNearestRounding rounding_guard;
 
+    if (dim <= 0) {
+        scale = 1.0f;
+        return;
+    }
+    const size_t dim_sz = static_cast<size_t>(dim);
+
     float max_abs = 0.0f;
     for (int i = 0; i < dim; ++i) {
         max_abs = std::max(max_abs, std::fabs(src[i]));
@@ -140,7 +146,7 @@ void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale) {
 
     if (max_abs == 0.0f) {
         scale = 1.0f;
-        std::memset(dst, 0, static_cast<size_t>(dim));
+        std::memset(dst, 0, dim_sz);
         return;
     }
 
