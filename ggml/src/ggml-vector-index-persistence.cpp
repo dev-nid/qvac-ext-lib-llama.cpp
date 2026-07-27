@@ -1459,7 +1459,6 @@ static bool inspect_delta_log_tail(
     uint8_t header[kTvidHeaderSize] = {};
     f.read(reinterpret_cast<char *>(header), sizeof(header));
     DeltaLogFormat format = DeltaLogFormat::v4;
-    DeltaStateKind state_kind = DeltaStateKind::state_token;
     if (!f ||
         std::memcmp(header, kTvidMagic, 4) != 0 ||
         !delta_log_format_from_version(header[4], format) ||
@@ -1469,7 +1468,6 @@ static bool inspect_delta_log_tail(
         get_u32_le(header + 8) != static_cast<uint32_t>(idx.dim)) {
         return false;
     }
-    state_kind = delta_state_kind_for_format(format);
     const size_t header_size = delta_header_size_for_format(format);
     if (file_size < header_size) {
         return false;
