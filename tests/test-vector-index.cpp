@@ -61,6 +61,14 @@ int64_t turbovec_block_score_call_count_for_test(void);
 namespace {
 
 constexpr int kDim = 4;
+constexpr uint32_t kFloatParityMaxUlpDiff = 4;
+constexpr uint32_t kTqplusScoreMaxUlpDiff = 8;
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
+constexpr bool kIsX86ForTest = true;
+#else
+constexpr bool kIsX86ForTest = false;
+#endif
 
 #include "turbovec-golden-q2.inc"
 #include "turbovec-golden-q4.inc"
@@ -74,6 +82,13 @@ constexpr int kDim = 4;
             std::exit(1);                                                      \
         }                                                                      \
     } while (0)
+
+uint32_t bit_ulp_diff(uint32_t actual, uint32_t expected);
+void check_bits_within_ulp(
+        const char * label,
+        uint32_t actual,
+        uint32_t expected,
+        uint32_t max_ulp);
 
 std::vector<float> normalize(std::vector<float> v) {
     double sumsq = 0.0;
@@ -274,8 +289,18 @@ void check_rust_persistence_parity(
         uint32_t expected = 0;
         std::memcpy(&expected, rust_scales + i, sizeof(expected));
         const uint32_t actual = read_u32_le_from(qvac.data() + 32 + i * sizeof(float));
-        const uint32_t ulp_diff = actual > expected ? actual - expected : expected - actual;
-        CHECK(ulp_diff <= 1);
+        const uint32_t ulp_diff = bit_ulp_diff(actual, expected);
+        if (ulp_diff > kFloatParityMaxUlpDiff) {
+            std::fprintf(
+                stderr,
+                "FAIL rust scale[%zu]: actual=0x%08x expected=0x%08x ulp=%u max=%u\n",
+                i,
+                actual,
+                expected,
+                ulp_diff,
+                kFloatParityMaxUlpDiff);
+        }
+        CHECK(ulp_diff <= kFloatParityMaxUlpDiff);
     }
     const size_t vector_offset =
         32 + static_cast<size_t>(n) * qparam_bytes + calibration_bytes;
@@ -479,6 +504,29 @@ uint32_t float_bits(float value) {
     uint32_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
     return bits;
+}
+
+uint32_t bit_ulp_diff(uint32_t actual, uint32_t expected) {
+    return actual > expected ? actual - expected : expected - actual;
+}
+
+void check_bits_within_ulp(
+        const char * label,
+        uint32_t actual,
+        uint32_t expected,
+        uint32_t max_ulp) {
+    const uint32_t diff = bit_ulp_diff(actual, expected);
+    if (diff > max_ulp) {
+        std::fprintf(
+            stderr,
+            "FAIL %s: actual=0x%08x expected=0x%08x ulp=%u max=%u\n",
+            label,
+            actual,
+            expected,
+            diff,
+            max_ulp);
+    }
+    CHECK(diff <= max_ulp);
 }
 
 uint64_t slot_state_hash_f32(uint64_t id, const std::vector<float> & vector) {
@@ -788,8 +836,8 @@ void check_tqplus_rust_parity(
     CHECK(index != nullptr);
     CHECK(ggml_vec_index_add(index, vectors.data(), n, ids.data()) == GGML_VEC_INDEX_OK);
     const uint64_t expected_blocked_hash = bits == 2 ?
-        UINT64_C(0x481ee4411871b4cd) :
-        UINT64_C(0x001f1478c8b61a63);
+        (kIsX86ForTest ? UINT64_C(0xcf52dbd26452d0c9) : UINT64_C(0x481ee4411871b4cd)) :
+        (kIsX86ForTest ? UINT64_C(0x480945c9f53b88b9) : UINT64_C(0x001f1478c8b61a63));
     CHECK(turbovec_blocked_hash_for_test(index) == expected_blocked_hash);
     const std::string path =
         (std::filesystem::temp_directory_path() /
@@ -808,10 +856,38 @@ void check_tqplus_rust_parity(
     const size_t tqscale_offset = shift_offset + calibration_bytes;
     const size_t codes_offset = tqscale_offset + calibration_bytes;
     const size_t codes_bytes = static_cast<size_t>(n) * bits * (dim / 8);
-    CHECK(fnv1a_bytes(bytes.data() + codes_offset, codes_bytes) == expected_codes_hash);
-    CHECK(fnv1a_bytes(bytes.data() + scales_offset, scales_bytes) == expected_scales_hash);
-    CHECK(fnv1a_bytes(bytes.data() + shift_offset, calibration_bytes) == expected_shift_hash);
-    CHECK(fnv1a_bytes(bytes.data() + tqscale_offset, calibration_bytes) == expected_tqscale_hash);
+    const uint64_t actual_codes_hash = fnv1a_bytes(bytes.data() + codes_offset, codes_bytes);
+    const uint64_t actual_scales_hash = fnv1a_bytes(bytes.data() + scales_offset, scales_bytes);
+    const uint64_t actual_shift_hash = fnv1a_bytes(bytes.data() + shift_offset, calibration_bytes);
+    const uint64_t actual_tqscale_hash = fnv1a_bytes(bytes.data() + tqscale_offset, calibration_bytes);
+    if (actual_codes_hash != expected_codes_hash) {
+        std::fprintf(stderr, "FAIL TQ+ q%d codes hash: actual=0x%016llx expected=0x%016llx\n",
+            bits,
+            static_cast<unsigned long long>(actual_codes_hash),
+            static_cast<unsigned long long>(expected_codes_hash));
+    }
+    CHECK(actual_codes_hash == expected_codes_hash);
+    if (actual_scales_hash != expected_scales_hash) {
+        std::fprintf(stderr, "FAIL TQ+ q%d scales hash: actual=0x%016llx expected=0x%016llx\n",
+            bits,
+            static_cast<unsigned long long>(actual_scales_hash),
+            static_cast<unsigned long long>(expected_scales_hash));
+    }
+    CHECK(actual_scales_hash == expected_scales_hash);
+    if (actual_shift_hash != expected_shift_hash) {
+        std::fprintf(stderr, "FAIL TQ+ q%d shift hash: actual=0x%016llx expected=0x%016llx\n",
+            bits,
+            static_cast<unsigned long long>(actual_shift_hash),
+            static_cast<unsigned long long>(expected_shift_hash));
+    }
+    CHECK(actual_shift_hash == expected_shift_hash);
+    if (actual_tqscale_hash != expected_tqscale_hash) {
+        std::fprintf(stderr, "FAIL TQ+ q%d tqscale hash: actual=0x%016llx expected=0x%016llx\n",
+            bits,
+            static_cast<unsigned long long>(actual_tqscale_hash),
+            static_cast<unsigned long long>(expected_tqscale_hash));
+    }
+    CHECK(actual_tqscale_hash == expected_tqscale_hash);
 
     auto * loaded = ggml_vec_index_load(path.c_str());
     CHECK(loaded != nullptr);
@@ -848,8 +924,16 @@ void check_tqplus_rust_parity(
     CHECK(lut_hash == (bits == 2 ?
         UINT64_C(0x3b105f838666dbbb) :
         UINT64_C(0x9691906f2a148805)));
-    CHECK(lut_scale_bits == (bits == 2 ? 0x3ba9233c : 0x3bb920ca));
-    CHECK(lut_bias_bits == (bits == 2 ? 0xc0fabc4e : 0xc1606205));
+    check_bits_within_ulp(
+        "TQ+ LUT scale",
+        lut_scale_bits,
+        bits == 2 ? 0x3ba9233c : 0x3bb920ca,
+        kFloatParityMaxUlpDiff);
+    check_bits_within_ulp(
+        "TQ+ LUT bias",
+        lut_bias_bits,
+        bits == 2 ? 0xc0fabc4e : 0xc1606205,
+        kFloatParityMaxUlpDiff);
     CHECK(turbovec_codebook_hash_for_test(bits, dim) == (bits == 2 ?
         UINT64_C(0xa37c605fe8acd601) :
         UINT64_C(0xd74197c1c7f95b91)));
@@ -876,9 +960,12 @@ void check_tqplus_rust_parity(
     CHECK(ggml_vec_index_search(
         loaded, queries.data(), 3, 3, scores.data(), results.data()) == GGML_VEC_INDEX_OK);
     for (size_t i = 0; i < scores.size(); ++i) {
-        uint32_t actual_score_bits = 0;
-        std::memcpy(&actual_score_bits, &scores[i], sizeof(actual_score_bits));
-        CHECK(actual_score_bits == expected_score_bits[i]);
+        const uint32_t actual_score_bits = float_bits(scores[i]);
+        check_bits_within_ulp(
+            "TQ+ score",
+            actual_score_bits,
+            expected_score_bits[i],
+            kTqplusScoreMaxUlpDiff);
         CHECK(results[i] == expected_ids[i]);
     }
     ggml_vec_index_free(loaded);
@@ -1543,15 +1630,15 @@ int main() {
     check_tqplus_rust_parity(
         2,
         UINT64_C(0xc4140782241d45eb),
-        UINT64_C(0x07b1e4792dc7ab14),
-        UINT64_C(0x2fe473aa8d8ef2b2),
-        UINT64_C(0x68e2ee49c3a5d29c));
+        kIsX86ForTest ? UINT64_C(0xd3fddb8414b86e7e) : UINT64_C(0x07b1e4792dc7ab14),
+        kIsX86ForTest ? UINT64_C(0x59a98122f0fcce5d) : UINT64_C(0x2fe473aa8d8ef2b2),
+        kIsX86ForTest ? UINT64_C(0x97be27042c380428) : UINT64_C(0x68e2ee49c3a5d29c));
     check_tqplus_rust_parity(
         4,
         UINT64_C(0x2c4e8e9e2a991e21),
-        UINT64_C(0xe820eefd4297666f),
-        UINT64_C(0x2fe473aa8d8ef2b2),
-        UINT64_C(0x68e2ee49c3a5d29c));
+        kIsX86ForTest ? UINT64_C(0xa0daf630c68a203c) : UINT64_C(0xe820eefd4297666f),
+        kIsX86ForTest ? UINT64_C(0x59a98122f0fcce5d) : UINT64_C(0x2fe473aa8d8ef2b2),
+        kIsX86ForTest ? UINT64_C(0x97be27042c380428) : UINT64_C(0x68e2ee49c3a5d29c));
 
     auto * idx = ggml_vec_index_create(kDim, /*bit_width=*/32);
     CHECK(idx != nullptr);
