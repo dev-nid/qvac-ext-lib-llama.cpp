@@ -105,7 +105,16 @@ inline bool write_bytes(std::FILE * f, const void * data, size_t size) {
         return false;
     }
 #endif
-    return std::fwrite(data, 1, size, f) == size;
+    const auto * ptr = static_cast<const uint8_t *>(data);
+    size_t written = 0;
+    while (written < size) {
+        const size_t n = std::fwrite(ptr + written, 1, size - written, f);
+        if (n == 0) {
+            return false;
+        }
+        written += n;
+    }
+    return true;
 }
 
 void put_u32_le(uint8_t * dst, uint32_t v) {
@@ -1035,86 +1044,67 @@ static std::shared_ptr<std::mutex> delta_log_process_mutex_for(const std::filesy
     return mutex;
 }
 
-class DeltaLogLock {
-public:
-    explicit DeltaLogLock(const char * path) {
-        std::filesystem::path lock_path;
-        if (!delta_lock_path(path, lock_path)) {
-            return;
-        }
-        process_mutex = delta_log_process_mutex_for(lock_path);
-        process_lock = std::unique_lock<std::mutex>(*process_mutex);
-#ifdef _WIN32
-        file = CreateFileW(
-            lock_path.wstring().c_str(),
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,
-            OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr);
-        if (file == INVALID_HANDLE_VALUE) {
-            return;
-        }
-        OVERLAPPED overlapped = {};
-        if (LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlapped) == 0) {
-            CloseHandle(file);
-            file = INVALID_HANDLE_VALUE;
-            return;
-        }
-#else
-        fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0666);
-        if (fd < 0) {
-            return;
-        }
-        struct flock lock = {};
-        lock.l_type = F_WRLCK;
-        lock.l_whence = SEEK_SET;
-        while (::fcntl(fd, F_SETLKW, &lock) != 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            ::close(fd);
-            fd = -1;
-            return;
-        }
-#endif
-        locked = true;
+DeltaLogLock::DeltaLogLock(const char * path) {
+    std::filesystem::path lock_path;
+    if (!delta_lock_path(path, lock_path)) {
+        return;
     }
-
-    ~DeltaLogLock() {
-        if (!locked) {
-            return;
-        }
+    process_mutex = delta_log_process_mutex_for(lock_path);
+    process_lock = std::unique_lock<std::mutex>(*process_mutex);
 #ifdef _WIN32
-        OVERLAPPED overlapped = {};
-        UnlockFileEx(file, 0, MAXDWORD, MAXDWORD, &overlapped);
+    file = CreateFileW(
+        lock_path.wstring().c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    OVERLAPPED overlapped = {};
+    if (LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &overlapped) == 0) {
         CloseHandle(file);
         file = INVALID_HANDLE_VALUE;
+        return;
+    }
 #else
-        struct flock lock = {};
-        lock.l_type = F_UNLCK;
-        lock.l_whence = SEEK_SET;
-        (void) ::fcntl(fd, F_SETLK, &lock);
+    fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0666);
+    if (fd < 0) {
+        return;
+    }
+    while (::flock(fd, LOCK_EX) != 0) {
+        if (errno == EINTR) {
+            continue;
+        }
         ::close(fd);
         fd = -1;
+        return;
+    }
 #endif
-    }
+    locked = true;
+}
 
-    bool ok() const {
-        return locked;
+DeltaLogLock::~DeltaLogLock() {
+    if (!locked) {
+        return;
     }
-
-private:
-    std::shared_ptr<std::mutex> process_mutex;
-    std::unique_lock<std::mutex> process_lock;
-    bool locked = false;
 #ifdef _WIN32
-    HANDLE file = INVALID_HANDLE_VALUE;
+    OVERLAPPED overlapped = {};
+    UnlockFileEx(file, 0, MAXDWORD, MAXDWORD, &overlapped);
+    CloseHandle(file);
+    file = INVALID_HANDLE_VALUE;
 #else
-    int fd = -1;
+    (void) ::flock(fd, LOCK_UN);
+    ::close(fd);
+    fd = -1;
 #endif
-};
+}
+
+bool DeltaLogLock::ok() const {
+    return locked;
+}
 
 static bool open_append_file(const char * path, std::FILE ** out) {
 #ifdef _WIN32
@@ -1594,7 +1584,7 @@ static bool delta_log_matches_index_state(const char * path, const ggml_vec_inde
         delta_state_matches(state_kind, tail_crc, tail_wide, current_crc, current_wide);
 }
 
-DeltaAppendResult append_delta_record(
+DeltaAppendResult append_delta_record_locked(
         ggml_vec_index & idx,
         const char * delta_path,
         DeltaLogFormat format,
@@ -1607,10 +1597,6 @@ DeltaAppendResult append_delta_record(
         const std::vector<uint8_t> & payload) {
     if (delta_path == nullptr) {
         return { GGML_VEC_INDEX_E_INVALID_ARG, false };
-    }
-    DeltaLogLock delta_lock(delta_path);
-    if (!delta_lock.ok()) {
-        return { GGML_VEC_INDEX_E_IO, false };
     }
 
     uint64_t old_size = 0;
@@ -2967,11 +2953,16 @@ bool replay_add_delta_f32(
         ptr += sizeof(uint32_t);
     }
 
-    const int status = ggml_vec_index_add(
+    const int status = ggml_vec_index_add_unlocked(
         idx,
         vectors.data(),
         static_cast<int>(n),
-        ids.data());
+        ids.data(),
+        /*finalize=*/false);
+    if (status == GGML_VEC_INDEX_OK) {
+        ++idx->generation;
+        invalidate_ivf(*idx);
+    }
     return status == GGML_VEC_INDEX_OK;
 }
 
@@ -3048,7 +3039,10 @@ bool replay_remove_delta(ggml_vec_index_t * idx, uint32_t n, const std::vector<u
     }
     // Writers only append remove records for live ids; a miss means the log no
     // longer matches the snapshot lineage and should be treated as corruption.
-    return ggml_vec_index_remove(idx, id) == 1;
+    return ggml_vec_index_remove_unlocked(
+        idx,
+        id,
+        /*allow_delta_bound=*/true) == 1;
 }
 
 bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path) {
@@ -3206,6 +3200,10 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path) {
 }
 
 } // namespace
+
+bool replay_delta_log_unlocked(ggml_vec_index_t * idx, const char * delta_path) {
+    return replay_delta_log(idx, delta_path);
+}
 
 int ggml_vec_index_load_with_delta_ex(
     const char * snapshot_path,

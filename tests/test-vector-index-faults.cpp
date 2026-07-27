@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -11,6 +12,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 extern "C" void ggml_vec_index_test_set_oom_countdown(int64_t countdown);
 extern "C" void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
@@ -95,6 +101,239 @@ void expect_no_temp_siblings(const std::string & path) {
         const std::string name = entry.path().filename().string();
         CHECK(name.compare(0, prefix.size(), prefix) != 0);
     }
+}
+
+void write_marker_file(const std::string & path) {
+    std::ofstream f(path, std::ios::binary);
+    CHECK(f.is_open());
+    f << "1";
+    CHECK(f.good());
+}
+
+bool wait_for_path(const std::string & path, int timeout_ms) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (std::filesystem::exists(path)) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return std::filesystem::exists(path);
+}
+
+std::string shell_quote(const std::string & value) {
+#ifdef _WIN32
+    std::string quoted = "\"";
+    for (char c : value) {
+        if (c == '"' || c == '\\') {
+            quoted.push_back('\\');
+        }
+        quoted.push_back(c);
+    }
+    quoted.push_back('"');
+    return quoted;
+#else
+    std::string quoted = "'";
+    for (char c : value) {
+        if (c == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted.push_back(c);
+        }
+    }
+    quoted.push_back('\'');
+    return quoted;
+#endif
+}
+
+int run_delta_writer_child(
+        const char * snapshot_path,
+        const char * delta_path,
+        const char * start_path,
+        const char * ready_path,
+        uint64_t id) {
+    auto * idx = ggml_vec_index_load(snapshot_path);
+    if (idx == nullptr) {
+        return 2;
+    }
+
+    write_marker_file(ready_path);
+    if (!wait_for_path(start_path, 5000)) {
+        ggml_vec_index_free(idx);
+        return 3;
+    }
+
+    const float scale = static_cast<float>((id % 17) + 1) * 0.125f;
+    const std::array<float, 4> vector = {
+        scale,
+        scale + 0.25f,
+        scale + 0.5f,
+        scale + 0.75f,
+    };
+    const int status = ggml_vec_index_add_logged(
+        idx, vector.data(), 1, &id, delta_path);
+    ggml_vec_index_free(idx);
+    return status == GGML_VEC_INDEX_OK ? 0 : 4;
+}
+
+std::string delta_writer_command(
+        const char * self_path,
+        const std::string & snapshot_path,
+        const std::string & delta_path,
+        const std::string & start_path,
+        const std::string & ready_path,
+        uint64_t id) {
+    return shell_quote(self_path) +
+        " --delta-writer " +
+        shell_quote(snapshot_path) + " " +
+        shell_quote(delta_path) + " " +
+        shell_quote(start_path) + " " +
+        shell_quote(ready_path) + " " +
+        std::to_string(id);
+}
+
+#ifndef _WIN32
+pid_t spawn_delta_writer_process(
+        const char * self_path,
+        const std::string & snapshot_path,
+        const std::string & delta_path,
+        const std::string & start_path,
+        const std::string & ready_path,
+        uint64_t id) {
+    const std::string id_arg = std::to_string(id);
+    const pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        execl(
+            self_path,
+            self_path,
+            "--delta-writer",
+            snapshot_path.c_str(),
+            delta_path.c_str(),
+            start_path.c_str(),
+            ready_path.c_str(),
+            id_arg.c_str(),
+            static_cast<char *>(nullptr));
+        _exit(127);
+    }
+    return pid;
+}
+
+int wait_delta_writer_process(pid_t pid) {
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        return -1;
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return -1;
+}
+#endif
+
+void test_cross_process_delta_appends(const char * self_path) {
+    constexpr int dim = 4;
+    const std::array<float, 8> base_vectors = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+    };
+    const std::array<uint64_t, 2> base_ids = { 601, 602 };
+    const uint64_t child_id_a = 603;
+    const uint64_t child_id_b = 604;
+
+    const std::string snapshot_path =
+        unique_temp_path("ggml-vector-index-process-delta-base.tvim");
+    const std::string delta_path =
+        unique_temp_path("ggml-vector-index-process-delta-log.tvid");
+    const std::string start_path =
+        unique_temp_path("ggml-vector-index-process-delta-start");
+    const std::string ready_path_a =
+        unique_temp_path("ggml-vector-index-process-delta-ready-a");
+    const std::string ready_path_b =
+        unique_temp_path("ggml-vector-index-process-delta-ready-b");
+
+    std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(delta_path);
+    std::filesystem::remove(delta_path + ".lock");
+    std::filesystem::remove(start_path);
+    std::filesystem::remove(ready_path_a);
+    std::filesystem::remove(ready_path_b);
+
+    auto * base = ggml_vec_index_create(dim, /*bit_width=*/32);
+    CHECK(base != nullptr);
+    CHECK(ggml_vec_index_add(
+        base, base_vectors.data(), 2, base_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(base, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(base);
+
+    const std::string command_a = delta_writer_command(
+        self_path, snapshot_path, delta_path, start_path, ready_path_a, child_id_a);
+    const std::string command_b = delta_writer_command(
+        self_path, snapshot_path, delta_path, start_path, ready_path_b, child_id_b);
+    int status_a = -1;
+    int status_b = -1;
+#ifndef _WIN32
+    const pid_t pid_a = spawn_delta_writer_process(
+        self_path, snapshot_path, delta_path, start_path, ready_path_a, child_id_a);
+    const pid_t pid_b = spawn_delta_writer_process(
+        self_path, snapshot_path, delta_path, start_path, ready_path_b, child_id_b);
+    const bool ready =
+        wait_for_path(ready_path_a, 5000) &&
+        wait_for_path(ready_path_b, 5000);
+    write_marker_file(start_path);
+    status_a = wait_delta_writer_process(pid_a);
+    status_b = wait_delta_writer_process(pid_b);
+#else
+    std::thread process_a([&]() {
+        status_a = std::system(command_a.c_str());
+    });
+    std::thread process_b([&]() {
+        status_b = std::system(command_b.c_str());
+    });
+
+    const bool ready =
+        wait_for_path(ready_path_a, 5000) &&
+        wait_for_path(ready_path_b, 5000);
+    write_marker_file(start_path);
+    process_a.join();
+    process_b.join();
+#endif
+
+    if (!ready || status_a != 0 || status_b != 0) {
+        std::fprintf(
+            stderr,
+            "cross-process delta append failed: ready=%d status_a=%d status_b=%d\ncmd_a=%s\ncmd_b=%s\n",
+            ready ? 1 : 0,
+            status_a,
+            status_b,
+            command_a.c_str(),
+            command_b.c_str());
+    }
+    CHECK(ready);
+    CHECK(status_a == 0);
+    CHECK(status_b == 0);
+    CHECK(std::filesystem::exists(delta_path + ".lock"));
+
+    auto * replayed = ggml_vec_index_load_with_delta(
+        snapshot_path.c_str(), delta_path.c_str());
+    CHECK(replayed != nullptr);
+    CHECK(ggml_vec_index_len(replayed) == 4);
+    CHECK(ggml_vec_index_contains(replayed, base_ids[0]) == 1);
+    CHECK(ggml_vec_index_contains(replayed, base_ids[1]) == 1);
+    CHECK(ggml_vec_index_contains(replayed, child_id_a) == 1);
+    CHECK(ggml_vec_index_contains(replayed, child_id_b) == 1);
+    ggml_vec_index_free(replayed);
+
+    std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(delta_path);
+    std::filesystem::remove(delta_path + ".lock");
+    std::filesystem::remove(start_path);
+    std::filesystem::remove(ready_path_a);
+    std::filesystem::remove(ready_path_b);
 }
 
 void test_quantized_logged_faults(int bit_width) {
@@ -185,7 +424,12 @@ void test_quantized_logged_faults(int bit_width) {
 
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    if (argc == 7 && std::string(argv[1]) == "--delta-writer") {
+        const uint64_t id = std::strtoull(argv[6], nullptr, 10);
+        return run_delta_writer_child(argv[2], argv[3], argv[4], argv[5], id);
+    }
+
     constexpr int dim = 4;
     const std::array<float, 8> base_vectors = {
         1.0f, 0.0f, 0.0f, 0.0f,
@@ -585,16 +829,16 @@ int main() {
     const uint64_t stale_tail_rejected_id = 803;
     CHECK(ggml_vec_index_add_logged(
         stale_writer, logged_vector.data(), 1,
-        &stale_tail_rejected_id, stale_tail_delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
-    CHECK(ggml_vec_index_contains(stale_writer, stale_tail_rejected_id) == 0);
+        &stale_tail_rejected_id, stale_tail_delta_path.c_str()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_contains(stale_writer, stale_tail_rejected_id) == 1);
 
     auto * stale_tail_replayed = ggml_vec_index_load_with_delta(
         stale_tail_snapshot_path.c_str(), stale_tail_delta_path.c_str());
     CHECK(stale_tail_replayed != nullptr);
-    CHECK(ggml_vec_index_len(stale_tail_replayed) == 4);
+    CHECK(ggml_vec_index_len(stale_tail_replayed) == 5);
     CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_id_a) == 1);
     CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_id_b) == 1);
-    CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_rejected_id) == 0);
+    CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_rejected_id) == 1);
     ggml_vec_index_free(stale_tail_replayed);
     ggml_vec_index_free(fresh_writer);
     ggml_vec_index_free(stale_writer);
@@ -749,23 +993,19 @@ int main() {
     thread_b.join();
     reset_fault_hooks();
 
-    CHECK((status_a == GGML_VEC_INDEX_OK && status_b == GGML_VEC_INDEX_E_IO) ||
-          (status_b == GGML_VEC_INDEX_OK && status_a == GGML_VEC_INDEX_E_IO));
-    CHECK(ggml_vec_index_contains(shared_a, shared_id_a) ==
-          (status_a == GGML_VEC_INDEX_OK ? 1 : 0));
-    CHECK(ggml_vec_index_contains(shared_b, shared_id_b) ==
-          (status_b == GGML_VEC_INDEX_OK ? 1 : 0));
+    CHECK(status_a == GGML_VEC_INDEX_OK);
+    CHECK(status_b == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_contains(shared_a, shared_id_a) == 1);
+    CHECK(ggml_vec_index_contains(shared_b, shared_id_b) == 1);
 
     auto * shared_replayed = ggml_vec_index_load_with_delta(
         shared_snapshot_path.c_str(), shared_delta_path.c_str());
     CHECK(shared_replayed != nullptr);
-    CHECK(ggml_vec_index_len(shared_replayed) == 3);
+    CHECK(ggml_vec_index_len(shared_replayed) == 4);
     CHECK(ggml_vec_index_contains(shared_replayed, base_ids[0]) == 1);
     CHECK(ggml_vec_index_contains(shared_replayed, base_ids[1]) == 1);
-    CHECK(ggml_vec_index_contains(shared_replayed, shared_id_a) ==
-          (status_a == GGML_VEC_INDEX_OK ? 1 : 0));
-    CHECK(ggml_vec_index_contains(shared_replayed, shared_id_b) ==
-          (status_b == GGML_VEC_INDEX_OK ? 1 : 0));
+    CHECK(ggml_vec_index_contains(shared_replayed, shared_id_a) == 1);
+    CHECK(ggml_vec_index_contains(shared_replayed, shared_id_b) == 1);
 
     ggml_vec_index_free(shared_replayed);
     ggml_vec_index_free(shared_a);
@@ -773,6 +1013,8 @@ int main() {
     std::filesystem::remove(shared_snapshot_path);
     std::filesystem::remove(shared_delta_path);
     std::filesystem::remove(shared_delta_path + ".lock");
+
+    test_cross_process_delta_appends(argv[0]);
 
     ggml_vec_index_free(idx);
     std::filesystem::remove(path);

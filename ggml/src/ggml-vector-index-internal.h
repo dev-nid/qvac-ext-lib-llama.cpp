@@ -31,6 +31,7 @@
 
 #ifndef _WIN32
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -206,6 +207,27 @@ struct DeltaAppendResult {
     bool record_complete = false;
 };
 
+class DeltaLogLock {
+public:
+    explicit DeltaLogLock(const char * path);
+    ~DeltaLogLock();
+
+    DeltaLogLock(const DeltaLogLock &) = delete;
+    DeltaLogLock & operator=(const DeltaLogLock &) = delete;
+
+    bool ok() const;
+
+private:
+    std::shared_ptr<std::mutex> process_mutex;
+    std::unique_lock<std::mutex> process_lock;
+    bool locked = false;
+#ifdef _WIN32
+    HANDLE file = INVALID_HANDLE_VALUE;
+#else
+    int fd = -1;
+#endif
+};
+
 #ifdef GGML_VEC_INDEX_TEST_HOOKS
 extern "C" {
 void ggml_vec_index_test_set_oom_countdown(int64_t countdown);
@@ -265,6 +287,16 @@ void rollback_appended_slots_unlocked(
     size_t base_slot,
     const uint64_t * ids,
     int n) noexcept;
+int ggml_vec_index_add_unlocked(
+    ggml_vec_index_t * idx,
+    const float * vectors,
+    int n,
+    const uint64_t * ids,
+    bool finalize);
+int ggml_vec_index_remove_unlocked(
+    ggml_vec_index_t * idx,
+    uint64_t id,
+    bool allow_delta_bound = false);
 
 uint32_t index_state_crc32c(const ggml_vec_index & idx);
 uint32_t index_state_crc32c_after_remove(const ggml_vec_index & idx, uint64_t id);
@@ -282,6 +314,7 @@ DeltaLogFormat delta_log_format_for_append(const char * path);
 uint32_t current_delta_state(const ggml_vec_index & idx, DeltaStateKind state_kind);
 DeltaStateWide current_delta_state_wide(const ggml_vec_index & idx);
 void invalidate_delta_tail_cache(ggml_vec_index & idx);
+bool replay_delta_log_unlocked(ggml_vec_index_t * idx, const char * delta_path);
 bool validate_logged_add_args(
     const ggml_vec_index_t * idx,
     const float * vectors,
@@ -303,7 +336,7 @@ bool build_add_delta_payload_from_slots(
     int n,
     std::vector<uint8_t> & payload);
 std::vector<uint8_t> build_remove_delta_payload(uint64_t id);
-DeltaAppendResult append_delta_record(
+DeltaAppendResult append_delta_record_locked(
     ggml_vec_index & idx,
     const char * delta_path,
     DeltaLogFormat format,

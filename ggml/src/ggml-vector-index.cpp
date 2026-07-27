@@ -281,7 +281,7 @@ void rollback_appended_slots_unlocked(
     idx->n_active = idx->id_to_slot.size();
 }
 
-static int ggml_vec_index_add_unlocked(
+int ggml_vec_index_add_unlocked(
     ggml_vec_index_t * idx,
     const float      * vectors,
     int                n,
@@ -425,10 +425,10 @@ int ggml_vec_index_add(
     }
 }
 
-static int ggml_vec_index_remove_unlocked(
+int ggml_vec_index_remove_unlocked(
         ggml_vec_index_t * idx,
         uint64_t id,
-        bool allow_delta_bound = false) {
+        bool allow_delta_bound) {
     try {
         if (idx == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -615,6 +615,20 @@ int ggml_vec_index_add_logged(
             return GGML_VEC_INDEX_OK;
         }
 
+        DeltaLogLock delta_lock(delta_path);
+        if (!delta_lock.ok()) {
+            return GGML_VEC_INDEX_E_IO;
+        }
+        const bool had_rebase_pending = idx->delta_log_rebase_pending;
+        if (!replay_delta_log_unlocked(idx, delta_path)) {
+            return GGML_VEC_INDEX_E_IO;
+        }
+        if (!had_rebase_pending) {
+            idx->delta_log_rebase_pending = false;
+            idx->delta_log_rebase_crc = 0;
+            idx->delta_log_rebase_wide = {};
+            idx->delta_log_rebase_state_kind = 0;
+        }
         const int duplicate_status = check_logged_add_duplicates(idx, n, ids);
         if (duplicate_status != GGML_VEC_INDEX_OK) {
             return duplicate_status;
@@ -656,7 +670,7 @@ int ggml_vec_index_add_logged(
 
         const uint32_t added_state_crc = current_delta_state(*idx, state_kind);
         const DeltaStateWide added_state_wide = current_delta_state_wide(*idx);
-        const DeltaAppendResult append_result = append_delta_record(
+        const DeltaAppendResult append_result = append_delta_record_locked(
             *idx,
             delta_path,
             format,
@@ -728,6 +742,20 @@ int ggml_vec_index_remove_logged(
         if (idx->read_only_mmap) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
+        DeltaLogLock delta_lock(delta_path);
+        if (!delta_lock.ok()) {
+            return GGML_VEC_INDEX_E_IO;
+        }
+        const bool had_rebase_pending = idx->delta_log_rebase_pending;
+        if (!replay_delta_log_unlocked(idx, delta_path)) {
+            return GGML_VEC_INDEX_E_IO;
+        }
+        if (!had_rebase_pending) {
+            idx->delta_log_rebase_pending = false;
+            idx->delta_log_rebase_crc = 0;
+            idx->delta_log_rebase_wide = {};
+            idx->delta_log_rebase_state_kind = 0;
+        }
         if (idx->id_to_slot.count(id) == 0) {
             return 0;
         }
@@ -741,7 +769,7 @@ int ggml_vec_index_remove_logged(
                 index_state_crc32c_after_remove(*idx, id) :
                 index_state_token_after_remove(*idx, id);
         const DeltaStateWide post_remove_wide = index_state_wide_after_remove(*idx, id);
-        const DeltaAppendResult append_result = append_delta_record(
+        const DeltaAppendResult append_result = append_delta_record_locked(
             *idx,
             delta_path,
             format,

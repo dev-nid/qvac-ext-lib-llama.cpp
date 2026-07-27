@@ -782,4 +782,3 @@ int ggml_vec_index_search_ivf(
         return GGML_VEC_INDEX_E_INTERNAL;
     }
 }
-
