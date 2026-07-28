@@ -639,6 +639,10 @@ int ggml_vec_index_add_logged(
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         prepared_path = first_logged_mutation;
+        if (!delta_lock.ensure_data_file_locked(delta_path)) {
+            discard_prepared_path();
+            return GGML_VEC_INDEX_E_IO;
+        }
         if (!delta_log_matches_index_unlocked(idx, delta_path)) {
             discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;
@@ -785,6 +789,10 @@ int ggml_vec_index_remove_logged(
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         prepared_path = first_logged_mutation;
+        if (!delta_lock.ensure_data_file_locked(delta_path)) {
+            discard_prepared_path();
+            return GGML_VEC_INDEX_E_IO;
+        }
         if (!delta_log_matches_index_unlocked(idx, delta_path)) {
             discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;

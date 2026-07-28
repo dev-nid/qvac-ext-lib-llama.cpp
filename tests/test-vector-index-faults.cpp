@@ -23,6 +23,7 @@ extern "C" void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 extern "C" void ggml_vec_index_test_set_truncate_fail(int fail);
 extern "C" void ggml_vec_index_test_set_parent_fsync_fail(int fail);
 extern "C" void ggml_vec_index_test_set_delta_append_wait_target(int target);
+extern "C" int ggml_vec_index_test_get_delta_append_waiters(void);
 extern "C" void ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms);
 extern "C" void ggml_vec_index_test_reset_delta_tail_scan_count(void);
 extern "C" int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);
@@ -235,7 +236,86 @@ int wait_delta_writer_process(pid_t pid) {
 }
 #endif
 
-void test_cross_process_delta_appends(const char * self_path) {
+void test_hardlink_delta_appends() {
+    constexpr int dim = 4;
+    const std::array<float, 8> base_vectors = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+    };
+    const std::array<uint64_t, 2> base_ids = { 701, 702 };
+    const std::array<float, 4> vector_a = { 0.5f, 0.25f, 0.0f, 0.0f };
+    const std::array<float, 4> vector_b = { 0.0f, 0.25f, 0.5f, 0.0f };
+    const uint64_t id_a = 703;
+    const uint64_t id_b = 704;
+
+    const std::string snapshot_path =
+        unique_temp_path("ggml-vector-index-hardlink-base.tvim");
+    const std::string delta_path =
+        unique_temp_path("ggml-vector-index-hardlink-log.tvid");
+    const std::string alias_path =
+        unique_temp_path("ggml-vector-index-hardlink-alias.tvid");
+
+    auto * base = ggml_vec_index_create(dim, /*bit_width=*/32);
+    CHECK(base != nullptr);
+    CHECK(ggml_vec_index_add(
+        base, base_vectors.data(), 2, base_ids.data()) == GGML_VEC_INDEX_OK);
+    CHECK(ggml_vec_index_write(base, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+    ggml_vec_index_free(base);
+
+    auto * writer_a = ggml_vec_index_load(snapshot_path.c_str());
+    auto * writer_b = ggml_vec_index_load(snapshot_path.c_str());
+    CHECK(writer_a != nullptr);
+    CHECK(writer_b != nullptr);
+
+    int status_a = GGML_VEC_INDEX_E_INTERNAL;
+    int status_b = GGML_VEC_INDEX_E_INTERNAL;
+    ggml_vec_index_test_set_delta_append_wait_target(2);
+    std::thread thread_a([&]() {
+        status_a = ggml_vec_index_add_logged(
+            writer_a, vector_a.data(), 1, &id_a, delta_path.c_str());
+    });
+    const auto wait_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (ggml_vec_index_test_get_delta_append_waiters() == 0 &&
+           std::chrono::steady_clock::now() < wait_deadline) {
+        std::this_thread::yield();
+    }
+    CHECK(ggml_vec_index_test_get_delta_append_waiters() == 1);
+
+    std::error_code hardlink_ec;
+    std::filesystem::create_hard_link(delta_path, alias_path, hardlink_ec);
+    CHECK(!hardlink_ec);
+    std::thread thread_b([&]() {
+        status_b = ggml_vec_index_add_logged(
+            writer_b, vector_b.data(), 1, &id_b, alias_path.c_str());
+    });
+    thread_a.join();
+    thread_b.join();
+    reset_fault_hooks();
+
+    CHECK((status_a == GGML_VEC_INDEX_OK && status_b == GGML_VEC_INDEX_E_IO) ||
+          (status_a == GGML_VEC_INDEX_E_IO && status_b == GGML_VEC_INDEX_OK));
+
+    auto * replayed = ggml_vec_index_load_with_delta(
+        snapshot_path.c_str(), delta_path.c_str());
+    CHECK(replayed != nullptr);
+    CHECK(ggml_vec_index_len(replayed) == 3);
+    CHECK(ggml_vec_index_contains(replayed, id_a) ==
+          (status_a == GGML_VEC_INDEX_OK ? 1 : 0));
+    CHECK(ggml_vec_index_contains(replayed, id_b) ==
+          (status_b == GGML_VEC_INDEX_OK ? 1 : 0));
+    ggml_vec_index_free(replayed);
+    ggml_vec_index_free(writer_a);
+    ggml_vec_index_free(writer_b);
+
+    std::filesystem::remove(snapshot_path);
+    std::filesystem::remove(delta_path);
+    std::filesystem::remove(alias_path);
+    std::filesystem::remove(delta_path + ".lock");
+    std::filesystem::remove(alias_path + ".lock");
+}
+
+void test_cross_process_delta_appends(const char * self_path, bool use_hardlink_alias) {
     constexpr int dim = 4;
     const std::array<float, 8> base_vectors = {
         1.0f, 0.0f, 0.0f, 0.0f,
@@ -249,6 +329,8 @@ void test_cross_process_delta_appends(const char * self_path) {
         unique_temp_path("ggml-vector-index-process-delta-base.tvim");
     const std::string delta_path =
         unique_temp_path("ggml-vector-index-process-delta-log.tvid");
+    const std::string alias_path =
+        unique_temp_path("ggml-vector-index-process-delta-alias.tvid");
     const std::string start_path =
         unique_temp_path("ggml-vector-index-process-delta-start");
     const std::string ready_path_a =
@@ -258,7 +340,9 @@ void test_cross_process_delta_appends(const char * self_path) {
 
     std::filesystem::remove(snapshot_path);
     std::filesystem::remove(delta_path);
+    std::filesystem::remove(alias_path);
     std::filesystem::remove(delta_path + ".lock");
+    std::filesystem::remove(alias_path + ".lock");
     std::filesystem::remove(start_path);
     std::filesystem::remove(ready_path_a);
     std::filesystem::remove(ready_path_b);
@@ -270,17 +354,29 @@ void test_cross_process_delta_appends(const char * self_path) {
     CHECK(ggml_vec_index_write(base, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
     ggml_vec_index_free(base);
 
+    std::string second_delta_path = delta_path;
+    if (use_hardlink_alias) {
+        {
+            std::ofstream empty_delta(delta_path, std::ios::binary);
+            CHECK(empty_delta.is_open());
+        }
+        std::error_code hardlink_ec;
+        std::filesystem::create_hard_link(delta_path, alias_path, hardlink_ec);
+        CHECK(!hardlink_ec);
+        second_delta_path = alias_path;
+    }
+
     const std::string command_a = delta_writer_command(
         self_path, snapshot_path, delta_path, start_path, ready_path_a, child_id_a);
     const std::string command_b = delta_writer_command(
-        self_path, snapshot_path, delta_path, start_path, ready_path_b, child_id_b);
+        self_path, snapshot_path, second_delta_path, start_path, ready_path_b, child_id_b);
     int status_a = -1;
     int status_b = -1;
 #ifndef _WIN32
     const pid_t pid_a = spawn_delta_writer_process(
         self_path, snapshot_path, delta_path, start_path, ready_path_a, child_id_a);
     const pid_t pid_b = spawn_delta_writer_process(
-        self_path, snapshot_path, delta_path, start_path, ready_path_b, child_id_b);
+        self_path, snapshot_path, second_delta_path, start_path, ready_path_b, child_id_b);
     const bool ready =
         wait_for_path(ready_path_a, 5000) &&
         wait_for_path(ready_path_b, 5000);
@@ -319,6 +415,9 @@ void test_cross_process_delta_appends(const char * self_path) {
     CHECK((status_a == 0 && status_b == 4) ||
           (status_a == 4 && status_b == 0));
     CHECK(std::filesystem::exists(delta_path + ".lock"));
+    if (use_hardlink_alias) {
+        CHECK(std::filesystem::exists(alias_path + ".lock"));
+    }
 
     auto * replayed = ggml_vec_index_load_with_delta(
         snapshot_path.c_str(), delta_path.c_str());
@@ -332,7 +431,9 @@ void test_cross_process_delta_appends(const char * self_path) {
 
     std::filesystem::remove(snapshot_path);
     std::filesystem::remove(delta_path);
+    std::filesystem::remove(alias_path);
     std::filesystem::remove(delta_path + ".lock");
+    std::filesystem::remove(alias_path + ".lock");
     std::filesystem::remove(start_path);
     std::filesystem::remove(ready_path_a);
     std::filesystem::remove(ready_path_b);
@@ -1021,7 +1122,9 @@ int main(int argc, char ** argv) {
     std::filesystem::remove(shared_delta_path);
     std::filesystem::remove(shared_delta_path + ".lock");
 
-    test_cross_process_delta_appends(argv[0]);
+    test_hardlink_delta_appends();
+    test_cross_process_delta_appends(argv[0], /*use_hardlink_alias=*/false);
+    test_cross_process_delta_appends(argv[0], /*use_hardlink_alias=*/true);
 
     ggml_vec_index_free(idx);
     std::filesystem::remove(path);

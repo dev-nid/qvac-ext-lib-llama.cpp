@@ -83,8 +83,9 @@ int main(void) {
 }
 ```
 
-`ggml_vec_index_search` fills each result row in descending score order. If fewer
-than `k` live entries are available, padded ids are set to `UINT64_MAX`.
+`ggml_vec_index_search` fills each result row in descending score order, with
+equal scores ordered by ascending id. If fewer than `k` live entries are
+available, padded ids are set to `UINT64_MAX`.
 
 ## Search Modes
 

@@ -218,15 +218,29 @@ public:
     DeltaLogLock & operator=(const DeltaLogLock &) = delete;
 
     bool ok() const;
+    bool ensure_data_file_locked(const char * path);
 
 private:
-    std::shared_ptr<std::mutex> process_mutex;
-    std::unique_lock<std::mutex> process_lock;
+    std::shared_ptr<std::mutex> sidecar_process_mutex;
+    std::shared_ptr<std::mutex> data_process_mutex;
+    std::unique_lock<std::mutex> sidecar_process_lock;
+    std::unique_lock<std::mutex> data_process_lock;
     bool locked = false;
 #ifdef _WIN32
-    HANDLE file = INVALID_HANDLE_VALUE;
+    HANDLE sidecar_file = INVALID_HANDLE_VALUE;
+    HANDLE data_file = INVALID_HANDLE_VALUE;
+    OVERLAPPED sidecar_lock_overlapped = {};
+    OVERLAPPED data_lock_overlapped = {};
+
+    bool lock_data_file(const std::filesystem::path & path, bool create);
+    static void close_file(HANDLE & file, OVERLAPPED & overlapped);
 #else
-    int fd = -1;
+    int sidecar_fd = -1;
+    int data_fd = -1;
+
+    static bool lock_fd(int fd);
+    bool lock_data_file(const std::filesystem::path & path, bool create);
+    static void close_fd(int & fd);
 #endif
 };
 
@@ -237,6 +251,7 @@ void ggml_vec_index_test_set_write_fail_after(int64_t bytes);
 void ggml_vec_index_test_set_truncate_fail(int fail);
 void ggml_vec_index_test_set_parent_fsync_fail(int fail);
 void ggml_vec_index_test_set_delta_append_wait_target(int target);
+int ggml_vec_index_test_get_delta_append_waiters(void);
 void ggml_vec_index_test_set_load_with_delta_pause_ms(int pause_ms);
 void ggml_vec_index_test_reset_delta_tail_scan_count(void);
 int64_t ggml_vec_index_test_get_delta_tail_scan_count(void);

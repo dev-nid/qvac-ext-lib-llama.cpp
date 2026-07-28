@@ -156,12 +156,12 @@ GGML_API int ggml_vec_index_build_ivf(
 
 // Top-k search. `queries` is `n_q * dim` row-major. `out_scores` and
 // `out_ids` are caller-allocated buffers of size `n_q * k`. Each row is
-// sorted descending by score (higher = closer / more similar). If the index
-// holds fewer than k entries, the remaining slots in each row are filled
-// with UINT64_MAX ids; callers must use out_ids[i] == UINT64_MAX to identify
-// padding. Padded score slots are filled with -FLT_MAX for compatibility, but
-// that value can also be a legitimate finite dot product. Read-only against
-// the index (does not mutate state).
+// sorted descending by score (higher = closer / more similar), with equal
+// scores ordered by ascending id. If the index holds fewer than k entries, the
+// remaining slots in each row are filled with UINT64_MAX ids; callers must use
+// out_ids[i] == UINT64_MAX to identify padding. Padded score slots are filled
+// with -FLT_MAX for compatibility, but that value can also be a legitimate
+// finite dot product. Read-only against the index (does not mutate state).
 // Exact search scans all live entries; use filtered or IVF search to reduce
 // the candidate set.
 //
