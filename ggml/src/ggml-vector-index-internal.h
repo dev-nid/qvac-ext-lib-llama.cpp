@@ -464,9 +464,10 @@ DeltaStateKind delta_state_kind_for_format(DeltaLogFormat format);
 DeltaLogFormat delta_log_format_for_append(const char * path);
 uint32_t current_delta_state(const ggml_vec_index & idx, DeltaStateKind state_kind);
 DeltaStateWide current_delta_state_wide(const ggml_vec_index & idx);
-void invalidate_delta_tail_cache(ggml_vec_index & idx);
+void invalidate_delta_tail_cache(ggml_vec_index & idx) noexcept;
 bool bind_delta_log_path(ggml_vec_index & idx, const char * delta_path);
 bool delta_log_matches_index_unlocked(const ggml_vec_index_t * idx, const char * delta_path);
+bool replay_delta_log_unlocked(ggml_vec_index_t * idx, const char * delta_path);
 bool validate_logged_add_args(
     const ggml_vec_index_t * idx,
     const float * vectors,

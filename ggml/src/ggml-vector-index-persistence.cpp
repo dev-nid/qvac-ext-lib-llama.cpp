@@ -3910,6 +3910,40 @@ bool delta_log_matches_index_unlocked(
         state_kind, tail_crc, tail_wide, current_crc, current_wide);
 }
 
+bool replay_delta_log_unlocked(ggml_vec_index_t * idx, const char * delta_path) {
+    if (idx == nullptr) {
+        return false;
+    }
+    uint64_t size = 0;
+    uint32_t base_crc = 0;
+    DeltaStateWide base_wide;
+    DeltaLogFormat format = DeltaLogFormat::v4;
+    DeltaStateKind state_kind = DeltaStateKind::wide_state;
+    if (!validate_delta_header(
+            delta_path, *idx, size, format, state_kind, base_crc, base_wide)) {
+        return false;
+    }
+    if (!delta_state_matches(
+            state_kind,
+            current_delta_state(*idx, state_kind),
+            current_delta_state_wide(*idx),
+            base_crc,
+            base_wide)) {
+        return false;
+    }
+    if (size != 0) {
+        uint32_t tail_crc = 0;
+        DeltaStateWide tail_wide;
+        uint64_t complete_size = 0;
+        if (!inspect_delta_log_tail(
+                delta_path, *idx, tail_crc, tail_wide, complete_size)) {
+            return false;
+        }
+    }
+    return replay_delta_log(idx, delta_path) &&
+        delta_log_matches_index_unlocked(idx, delta_path);
+}
+
 int ggml_vec_index_load_with_delta_ex(
     const char * snapshot_path,
     const char * delta_path,
