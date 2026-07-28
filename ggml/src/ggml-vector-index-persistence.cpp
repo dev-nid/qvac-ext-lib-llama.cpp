@@ -942,6 +942,18 @@ static bool delta_log_path_key(const char * path, std::string & out) {
     return true;
 }
 
+bool bind_delta_log_path(ggml_vec_index & idx, const char * delta_path) {
+    std::string path_key;
+    if (!delta_log_path_key(delta_path, path_key)) {
+        return false;
+    }
+    if (idx.bound_delta_log_path_key.empty()) {
+        idx.bound_delta_log_path_key.swap(path_key);
+        return true;
+    }
+    return idx.bound_delta_log_path_key == path_key;
+}
+
 static bool delta_file_stamp(const char * path, DeltaFileStamp & stamp) {
     stamp = {};
     std::filesystem::path fs_path;
@@ -2153,6 +2165,9 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
     }
     try {
         std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        if (idx->delta_log_bound) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         return ggml_vec_index_write_unlocked(idx, path);
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
@@ -3243,6 +3258,9 @@ ggml_vec_index_t * ggml_vec_index_load_with_delta(
         if (!replay_delta_log(idx.get(), delta_path)) {
             return load_fail(GGML_VEC_INDEX_E_IO);
         }
+        if (!bind_delta_log_path(*idx, delta_path)) {
+            return load_fail(GGML_VEC_INDEX_E_INVALID_ARG);
+        }
         idx->delta_log_bound = true;
         g_last_load_error = GGML_VEC_INDEX_OK;
         return idx.release();
@@ -3272,12 +3290,29 @@ int ggml_vec_index_compact_delta(
         if (!delta_lock.ok()) {
             return GGML_VEC_INDEX_E_IO;
         }
+        if (idx->delta_log_bound && !bind_delta_log_path(*idx, delta_path)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         if (!delta_log_matches_index_state(delta_path, *idx)) {
             return GGML_VEC_INDEX_E_IO;
         }
+        const DeltaStateKind rebase_state_kind =
+            delta_state_kind_for_format(delta_log_format_for_append(delta_path));
+        auto mark_rebase_pending = [&]() {
+            idx->delta_log_rebase_pending = true;
+            idx->delta_log_rebase_crc = current_delta_state(*idx, rebase_state_kind);
+            idx->delta_log_rebase_wide = index_state_wide(*idx);
+            idx->delta_log_rebase_state_kind =
+                delta_state_kind_cache_value(rebase_state_kind);
+        };
         const int write_status = ggml_vec_index_write_unlocked(idx, snapshot_path);
         if (write_status != GGML_VEC_INDEX_OK) {
             if (snapshot_matches_index(*idx, snapshot_path)) {
+                if (!bind_delta_log_path(*idx, delta_path)) {
+                    return GGML_VEC_INDEX_E_INVALID_ARG;
+                }
+                idx->delta_log_bound = true;
+                mark_rebase_pending();
                 return GGML_VEC_INDEX_E_PARTIAL_COMPACT;
             }
             return write_status;
@@ -3285,6 +3320,11 @@ int ggml_vec_index_compact_delta(
         const int delta_status = write_empty_delta_log_unlocked(*idx, delta_path);
         if (delta_status != GGML_VEC_INDEX_OK) {
             invalidate_delta_tail_cache(*idx);
+            if (!bind_delta_log_path(*idx, delta_path)) {
+                return GGML_VEC_INDEX_E_INVALID_ARG;
+            }
+            idx->delta_log_bound = true;
+            mark_rebase_pending();
             return GGML_VEC_INDEX_E_PARTIAL_COMPACT;
         }
         update_delta_tail_cache(
@@ -3297,6 +3337,9 @@ int ggml_vec_index_compact_delta(
         idx->delta_log_rebase_crc = 0;
         idx->delta_log_rebase_wide = {};
         idx->delta_log_rebase_state_kind = 0;
+        if (!bind_delta_log_path(*idx, delta_path)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         idx->delta_log_bound = true;
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {

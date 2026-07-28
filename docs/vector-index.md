@@ -133,7 +133,7 @@ its stored post-state identity.
 After a handle has been loaded with a delta log or has used logged mutations,
 content changes must continue through `ggml_vec_index_add_logged`,
 `ggml_vec_index_remove_logged`, or `ggml_vec_index_compact_delta`. Plain
-add/remove/compact calls are rejected on delta-bound handles.
+add/remove/compact/write calls are rejected on delta-bound handles.
 
 Readers still accept legacy v1/v2 delta logs. New q4/q8 adds are not appended
 to those f32-payload log formats; compact first so subsequent quantized adds use

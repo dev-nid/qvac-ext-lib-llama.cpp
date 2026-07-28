@@ -112,7 +112,8 @@ GGML_API int ggml_vec_index_compact(ggml_vec_index_t * idx);
 // If an append error occurs after a complete replayable record is observed,
 // the mutation is treated as committed and the API returns OK.
 // Once a handle participates in delta logging, use logged mutations for
-// content changes; plain add/remove/compact return GGML_VEC_INDEX_E_INVALID_ARG.
+// content changes and compact_delta for snapshots; plain add/remove/compact/write
+// return GGML_VEC_INDEX_E_INVALID_ARG.
 // Adding q4/q8 entries to legacy v1/v2 f32-payload logs is rejected; compact
 // the snapshot+delta pair first so new quantized adds use native-code v4 logs.
 GGML_API int ggml_vec_index_add_logged(

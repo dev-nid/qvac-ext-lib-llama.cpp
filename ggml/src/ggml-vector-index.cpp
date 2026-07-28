@@ -619,6 +619,9 @@ int ggml_vec_index_add_logged(
         if (!delta_lock.ok()) {
             return GGML_VEC_INDEX_E_IO;
         }
+        if (idx->delta_log_bound && !bind_delta_log_path(*idx, delta_path)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         const bool had_rebase_pending = idx->delta_log_rebase_pending;
         if (!replay_delta_log_unlocked(idx, delta_path)) {
             return GGML_VEC_INDEX_E_IO;
@@ -685,6 +688,9 @@ int ggml_vec_index_add_logged(
             if (append_result.record_complete) {
                 ++idx->generation;
                 invalidate_ivf(*idx);
+                if (!bind_delta_log_path(*idx, delta_path)) {
+                    return GGML_VEC_INDEX_E_INTERNAL;
+                }
                 idx->delta_log_bound = true;
                 added = false;
                 return GGML_VEC_INDEX_OK;
@@ -701,6 +707,9 @@ int ggml_vec_index_add_logged(
         }
         ++idx->generation;
         invalidate_ivf(*idx);
+        if (!bind_delta_log_path(*idx, delta_path)) {
+            return GGML_VEC_INDEX_E_INTERNAL;
+        }
         idx->delta_log_bound = true;
         added = false;
         return GGML_VEC_INDEX_OK;
@@ -746,6 +755,9 @@ int ggml_vec_index_remove_logged(
         if (!delta_lock.ok()) {
             return GGML_VEC_INDEX_E_IO;
         }
+        if (idx->delta_log_bound && !bind_delta_log_path(*idx, delta_path)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         const bool had_rebase_pending = idx->delta_log_rebase_pending;
         if (!replay_delta_log_unlocked(idx, delta_path)) {
             return GGML_VEC_INDEX_E_IO;
@@ -785,6 +797,9 @@ int ggml_vec_index_remove_logged(
                 const int remove_status = ggml_vec_index_remove_unlocked(
                     idx, id, /*allow_delta_bound=*/true);
                 if (remove_status == 1) {
+                    if (!bind_delta_log_path(*idx, delta_path)) {
+                        return GGML_VEC_INDEX_E_INTERNAL;
+                    }
                     idx->delta_log_bound = true;
                 }
                 return remove_status;
@@ -794,6 +809,9 @@ int ggml_vec_index_remove_logged(
         const int remove_status = ggml_vec_index_remove_unlocked(
             idx, id, /*allow_delta_bound=*/true);
         if (remove_status == 1) {
+            if (!bind_delta_log_path(*idx, delta_path)) {
+                return GGML_VEC_INDEX_E_INTERNAL;
+            }
             idx->delta_log_bound = true;
         }
         return remove_status;

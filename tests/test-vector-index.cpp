@@ -1286,11 +1286,20 @@ int main() {
         const std::string corrupt_delta_path =
             (std::filesystem::temp_directory_path() /
              "ggml-vector-index-delta-corrupt.tvid").string();
+        const std::string other_delta_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-delta-other.tvid").string();
+        const std::string delta_bound_write_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-delta-bound-write.tvim").string();
         std::filesystem::remove(snapshot_path);
         std::filesystem::remove(delta_path);
         std::filesystem::remove(missing_delta_path);
         std::filesystem::remove(mismatched_snapshot_path);
         std::filesystem::remove(corrupt_delta_path);
+        std::filesystem::remove(other_delta_path);
+        std::filesystem::remove(other_delta_path + ".lock");
+        std::filesystem::remove(delta_bound_write_path);
 
         auto * base = ggml_vec_index_create(kDim, /*bit_width=*/32);
         CHECK(base != nullptr);
@@ -1310,6 +1319,9 @@ int main() {
             GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_remove(base_only, ids[0]) == GGML_VEC_INDEX_E_INVALID_ARG);
         CHECK(ggml_vec_index_compact(base_only) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_write(base_only, delta_bound_write_path.c_str()) ==
+              GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(!std::filesystem::exists(delta_bound_write_path));
         ggml_vec_index_free(base_only);
 
         const uint64_t reserved_delta_id = UINT64_MAX;
@@ -1325,6 +1337,15 @@ int main() {
         const uint64_t delta_id = (1ULL << 41) + 7ULL;
         CHECK(ggml_vec_index_add_logged(
             base, seeds[2].data(), 1, &delta_id, delta_path.c_str()) == GGML_VEC_INDEX_OK);
+        const uint64_t wrong_delta_id = (1ULL << 41) + 12ULL;
+        CHECK(ggml_vec_index_add_logged(
+            base, seeds[3].data(), 1, &wrong_delta_id, other_delta_path.c_str()) ==
+            GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_contains(base, wrong_delta_id) == 0);
+        CHECK(ggml_vec_index_remove_logged(
+            base, ids[1], other_delta_path.c_str()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_contains(base, ids[1]) == 1);
+        CHECK(!std::filesystem::exists(other_delta_path));
         CHECK(ggml_vec_index_remove_logged(
             base, ids[0], delta_path.c_str()) == 1);
         CHECK(ggml_vec_index_add_logged(
@@ -1479,6 +1500,7 @@ int main() {
         CHECK(ggml_vec_index_add_logged(
             compacted_with_old_log, seeds[3].data(), 1, &post_crash_compact_id, delta_path.c_str()) ==
             GGML_VEC_INDEX_OK);
+        CHECK(std::filesystem::file_size(delta_path) < pre_compact_delta.size());
         auto * replayed_after_old_log_append = ggml_vec_index_load_with_delta(
             snapshot_path.c_str(), delta_path.c_str());
         CHECK(replayed_after_old_log_append != nullptr);
@@ -1543,6 +1565,9 @@ int main() {
         std::filesystem::remove(delta_path);
         std::filesystem::remove(mismatched_snapshot_path);
         std::filesystem::remove(corrupt_delta_path);
+        std::filesystem::remove(other_delta_path);
+        std::filesystem::remove(other_delta_path + ".lock");
+        std::filesystem::remove(delta_bound_write_path);
     }
 
     // Delta replay supports tombstone delete followed by re-adding the same ID.
@@ -1702,6 +1727,12 @@ int main() {
             CHECK(ggml_vec_index_remove(mapped, mmap_ids[0])
                   == GGML_VEC_INDEX_E_INVALID_ARG);
             CHECK(ggml_vec_index_compact(mapped) == GGML_VEC_INDEX_E_INVALID_ARG);
+            CHECK(ggml_vec_index_write(mapped, mmap_copy_path.c_str()) == GGML_VEC_INDEX_OK);
+            auto * copied = ggml_vec_index_load(mmap_copy_path.c_str());
+            CHECK(copied != nullptr);
+            CHECK(ggml_vec_index_len(copied) == static_cast<int>(mmap_ids.size()));
+            ggml_vec_index_free(copied);
+
             CHECK(ggml_vec_index_compact_delta(
                 mapped, mmap_copy_path.c_str(), mmap_delta_path.c_str()) ==
                 GGML_VEC_INDEX_OK);
@@ -1711,12 +1742,9 @@ int main() {
             CHECK(ggml_vec_index_len(compacted) == static_cast<int>(mmap_ids.size()));
             CHECK(ggml_vec_index_write(mapped, mmap_path.c_str())
                   == GGML_VEC_INDEX_E_INVALID_ARG);
-            CHECK(ggml_vec_index_write(mapped, mmap_copy_path.c_str()) == GGML_VEC_INDEX_OK);
-            auto * copied = ggml_vec_index_load(mmap_copy_path.c_str());
-            CHECK(copied != nullptr);
-            CHECK(ggml_vec_index_len(copied) == static_cast<int>(mmap_ids.size()));
+            CHECK(ggml_vec_index_write(mapped, mmap_copy_path.c_str())
+                  == GGML_VEC_INDEX_E_INVALID_ARG);
 
-            ggml_vec_index_free(copied);
             ggml_vec_index_free(compacted);
             ggml_vec_index_free(mapped);
             ggml_vec_index_free(normal);
@@ -2119,8 +2147,10 @@ int main() {
             CHECK(ggml_vec_index_contains(compacted_quant, delta_id) == 1);
             ggml_vec_index_free(compacted_quant);
 
+            auto * quant_v2 = ggml_vec_index_load(snapshot_path.c_str());
+            CHECK(quant_v2 != nullptr);
             CHECK(ggml_vec_index_compact_delta(
-                quant_delta, snapshot_path.c_str(), v2_delta_path.c_str()) ==
+                quant_v2, snapshot_path.c_str(), v2_delta_path.c_str()) ==
                 GGML_VEC_INDEX_OK);
             const std::vector<uint8_t> compacted_v4 = read_file_bytes(v2_delta_path);
             CHECK(compacted_v4.size() == 48);
@@ -2132,9 +2162,9 @@ int main() {
             const uint64_t v2_delta_id =
                 (1ULL << 42) + static_cast<uint64_t>(bit_width + 200);
             CHECK(ggml_vec_index_add_logged(
-                quant_delta, seeds[1].data(), 1, &v2_delta_id, v2_delta_path.c_str()) ==
+                quant_v2, seeds[1].data(), 1, &v2_delta_id, v2_delta_path.c_str()) ==
                 GGML_VEC_INDEX_E_INVALID_ARG);
-            CHECK(ggml_vec_index_contains(quant_delta, v2_delta_id) == 0);
+            CHECK(ggml_vec_index_contains(quant_v2, v2_delta_id) == 0);
 
             std::vector<uint8_t> v2_payload;
             append_u64_le(v2_payload, v2_delta_id);
@@ -2186,6 +2216,7 @@ int main() {
             CHECK(ggml_vec_index_contains(replayed_v2, v2_delta_id) == 1);
 
             ggml_vec_index_free(replayed_v2);
+            ggml_vec_index_free(quant_v2);
             ggml_vec_index_free(replayed_quant);
             ggml_vec_index_free(quant_delta);
             std::filesystem::remove(snapshot_path);
