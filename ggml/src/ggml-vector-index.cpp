@@ -300,10 +300,7 @@ int ggml_vec_index_add_unlocked(
     };
 
     try {
-        if (idx == nullptr || vectors == nullptr || ids == nullptr) {
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
-        if (idx->read_only_mmap) {
+        if (idx == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         if (n < 0) {
@@ -311,6 +308,9 @@ int ggml_vec_index_add_unlocked(
         }
         if (n == 0) {
             return GGML_VEC_INDEX_OK;
+        }
+        if (vectors == nullptr || ids == nullptr || idx->read_only_mmap) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         if (finalize && idx->delta_log_bound) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -398,6 +398,7 @@ int ggml_vec_index_add_unlocked(
         if (finalize) {
             ++idx->generation;
             invalidate_ivf(*idx);
+            idx->delta_log_start_allowed = false;
         }
     } catch (const std::bad_alloc &) {
         rollback();
@@ -457,6 +458,9 @@ int ggml_vec_index_remove_unlocked(
         idx->id_to_slot.erase(it);
         ++idx->generation;
         invalidate_ivf(*idx);
+        if (!allow_delta_bound) {
+            idx->delta_log_start_allowed = false;
+        }
         return 1;
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
@@ -571,6 +575,7 @@ static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
         idx->n_active = idx->slot_to_id.size();
         ++idx->generation;
         invalidate_ivf(*idx);
+        idx->delta_log_start_allowed = false;
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
         return GGML_VEC_INDEX_E_OOM;
@@ -598,8 +603,15 @@ int ggml_vec_index_add_logged(
     const uint64_t   * ids,
     const char       * delta_path) {
     bool added = false;
+    bool prepared_path = false;
     size_t base_slot = 0;
     std::unique_lock<std::shared_mutex> lock;
+    auto discard_prepared_path = [&]() noexcept {
+        if (prepared_path && idx != nullptr && !idx->delta_log_bound) {
+            idx->bound_delta_log_path_key.clear();
+            prepared_path = false;
+        }
+    };
     try {
         if (idx == nullptr || delta_path == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -619,27 +631,28 @@ int ggml_vec_index_add_logged(
         if (!delta_lock.ok()) {
             return GGML_VEC_INDEX_E_IO;
         }
-        if (idx->delta_log_bound && !bind_delta_log_path(*idx, delta_path)) {
+        const bool first_logged_mutation = !idx->delta_log_bound;
+        if (first_logged_mutation && !idx->delta_log_start_allowed) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        const bool had_rebase_pending = idx->delta_log_rebase_pending;
-        if (!replay_delta_log_unlocked(idx, delta_path)) {
-            return GGML_VEC_INDEX_E_IO;
+        if (!bind_delta_log_path(*idx, delta_path)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        if (!had_rebase_pending) {
-            idx->delta_log_rebase_pending = false;
-            idx->delta_log_rebase_crc = 0;
-            idx->delta_log_rebase_wide = {};
-            idx->delta_log_rebase_state_kind = 0;
+        prepared_path = first_logged_mutation;
+        if (!delta_log_matches_index_unlocked(idx, delta_path)) {
+            discard_prepared_path();
+            return GGML_VEC_INDEX_E_IO;
         }
         const int duplicate_status = check_logged_add_duplicates(idx, n, ids);
         if (duplicate_status != GGML_VEC_INDEX_OK) {
+            discard_prepared_path();
             return duplicate_status;
         }
 
         const DeltaLogFormat format = delta_log_format_for_append(delta_path);
         if (is_quantized(*idx) &&
             (format == DeltaLogFormat::v1 || format == DeltaLogFormat::v2)) {
+            discard_prepared_path();
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         const DeltaStateKind state_kind = delta_state_kind_for_format(format);
@@ -650,12 +663,14 @@ int ggml_vec_index_add_logged(
         if (format != DeltaLogFormat::v3 &&
             format != DeltaLogFormat::v4 &&
             !build_add_delta_payload_f32(idx, vectors, n, ids, payload)) {
+            discard_prepared_path();
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
         base_slot = idx->slot_to_id.size();
         const int add_status = ggml_vec_index_add_unlocked(idx, vectors, n, ids, false);
         if (add_status != GGML_VEC_INDEX_OK) {
+            discard_prepared_path();
             return add_status;
         }
         added = true;
@@ -668,6 +683,7 @@ int ggml_vec_index_add_logged(
             }
             rollback_appended_slots_unlocked(idx, base_slot, ids, n);
             added = false;
+            discard_prepared_path();
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
@@ -688,10 +704,8 @@ int ggml_vec_index_add_logged(
             if (append_result.record_complete) {
                 ++idx->generation;
                 invalidate_ivf(*idx);
-                if (!bind_delta_log_path(*idx, delta_path)) {
-                    return GGML_VEC_INDEX_E_INTERNAL;
-                }
                 idx->delta_log_bound = true;
+                prepared_path = false;
                 added = false;
                 return GGML_VEC_INDEX_OK;
             } else {
@@ -703,14 +717,13 @@ int ggml_vec_index_add_logged(
                 rollback_appended_slots_unlocked(idx, base_slot, ids, n);
             }
             added = false;
+            discard_prepared_path();
             return append_result.status;
         }
         ++idx->generation;
         invalidate_ivf(*idx);
-        if (!bind_delta_log_path(*idx, delta_path)) {
-            return GGML_VEC_INDEX_E_INTERNAL;
-        }
         idx->delta_log_bound = true;
+        prepared_path = false;
         added = false;
         return GGML_VEC_INDEX_OK;
     } catch (const std::bad_alloc &) {
@@ -722,6 +735,7 @@ int ggml_vec_index_add_logged(
             }
             rollback_appended_slots_unlocked(idx, base_slot, ids, n);
         }
+        discard_prepared_path();
         return GGML_VEC_INDEX_E_OOM;
     } catch (...) {
         if (added) {
@@ -732,6 +746,7 @@ int ggml_vec_index_add_logged(
             }
             rollback_appended_slots_unlocked(idx, base_slot, ids, n);
         }
+        discard_prepared_path();
         return GGML_VEC_INDEX_E_INTERNAL;
     }
 }
@@ -740,6 +755,13 @@ int ggml_vec_index_remove_logged(
     ggml_vec_index_t * idx,
     uint64_t           id,
     const char       * delta_path) {
+    bool prepared_path = false;
+    auto discard_prepared_path = [&]() noexcept {
+        if (prepared_path && idx != nullptr && !idx->delta_log_bound) {
+            idx->bound_delta_log_path_key.clear();
+            prepared_path = false;
+        }
+    };
     try {
         if (idx == nullptr || delta_path == nullptr) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
@@ -755,20 +777,20 @@ int ggml_vec_index_remove_logged(
         if (!delta_lock.ok()) {
             return GGML_VEC_INDEX_E_IO;
         }
-        if (idx->delta_log_bound && !bind_delta_log_path(*idx, delta_path)) {
+        const bool first_logged_mutation = !idx->delta_log_bound;
+        if (first_logged_mutation && !idx->delta_log_start_allowed) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        const bool had_rebase_pending = idx->delta_log_rebase_pending;
-        if (!replay_delta_log_unlocked(idx, delta_path)) {
+        if (!bind_delta_log_path(*idx, delta_path)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        prepared_path = first_logged_mutation;
+        if (!delta_log_matches_index_unlocked(idx, delta_path)) {
+            discard_prepared_path();
             return GGML_VEC_INDEX_E_IO;
         }
-        if (!had_rebase_pending) {
-            idx->delta_log_rebase_pending = false;
-            idx->delta_log_rebase_crc = 0;
-            idx->delta_log_rebase_wide = {};
-            idx->delta_log_rebase_state_kind = 0;
-        }
         if (idx->id_to_slot.count(id) == 0) {
+            discard_prepared_path();
             return 0;
         }
         const std::vector<uint8_t> payload = build_remove_delta_payload(id);
@@ -797,27 +819,26 @@ int ggml_vec_index_remove_logged(
                 const int remove_status = ggml_vec_index_remove_unlocked(
                     idx, id, /*allow_delta_bound=*/true);
                 if (remove_status == 1) {
-                    if (!bind_delta_log_path(*idx, delta_path)) {
-                        return GGML_VEC_INDEX_E_INTERNAL;
-                    }
                     idx->delta_log_bound = true;
+                    prepared_path = false;
                 }
                 return remove_status;
             }
+            discard_prepared_path();
             return append_result.status;
         }
         const int remove_status = ggml_vec_index_remove_unlocked(
             idx, id, /*allow_delta_bound=*/true);
         if (remove_status == 1) {
-            if (!bind_delta_log_path(*idx, delta_path)) {
-                return GGML_VEC_INDEX_E_INTERNAL;
-            }
             idx->delta_log_bound = true;
+            prepared_path = false;
         }
         return remove_status;
     } catch (const std::bad_alloc &) {
+        discard_prepared_path();
         return GGML_VEC_INDEX_E_OOM;
     } catch (...) {
+        discard_prepared_path();
         return GGML_VEC_INDEX_E_INTERNAL;
     }
 }

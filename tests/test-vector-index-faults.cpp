@@ -303,7 +303,9 @@ void test_cross_process_delta_appends(const char * self_path) {
     process_b.join();
 #endif
 
-    if (!ready || status_a != 0 || status_b != 0) {
+    if (!ready ||
+        !((status_a == 0 && status_b == 4) ||
+          (status_a == 4 && status_b == 0))) {
         std::fprintf(
             stderr,
             "cross-process delta append failed: ready=%d status_a=%d status_b=%d\ncmd_a=%s\ncmd_b=%s\n",
@@ -314,18 +316,18 @@ void test_cross_process_delta_appends(const char * self_path) {
             command_b.c_str());
     }
     CHECK(ready);
-    CHECK(status_a == 0);
-    CHECK(status_b == 0);
+    CHECK((status_a == 0 && status_b == 4) ||
+          (status_a == 4 && status_b == 0));
     CHECK(std::filesystem::exists(delta_path + ".lock"));
 
     auto * replayed = ggml_vec_index_load_with_delta(
         snapshot_path.c_str(), delta_path.c_str());
     CHECK(replayed != nullptr);
-    CHECK(ggml_vec_index_len(replayed) == 4);
+    CHECK(ggml_vec_index_len(replayed) == 3);
     CHECK(ggml_vec_index_contains(replayed, base_ids[0]) == 1);
     CHECK(ggml_vec_index_contains(replayed, base_ids[1]) == 1);
-    CHECK(ggml_vec_index_contains(replayed, child_id_a) == 1);
-    CHECK(ggml_vec_index_contains(replayed, child_id_b) == 1);
+    CHECK(ggml_vec_index_contains(replayed, child_id_a) == (status_a == 0 ? 1 : 0));
+    CHECK(ggml_vec_index_contains(replayed, child_id_b) == (status_b == 0 ? 1 : 0));
     ggml_vec_index_free(replayed);
 
     std::filesystem::remove(snapshot_path);
@@ -568,6 +570,7 @@ int main(int argc, char ** argv) {
         std::filesystem::remove(parent_fsync_path);
     }
 
+    CHECK(ggml_vec_index_write(idx, path.c_str()) == GGML_VEC_INDEX_OK);
     const std::string delta_path =
         unique_temp_path("ggml-vector-index-fault-test.tvid");
     std::filesystem::remove(delta_path);
@@ -829,16 +832,16 @@ int main(int argc, char ** argv) {
     const uint64_t stale_tail_rejected_id = 803;
     CHECK(ggml_vec_index_add_logged(
         stale_writer, logged_vector.data(), 1,
-        &stale_tail_rejected_id, stale_tail_delta_path.c_str()) == GGML_VEC_INDEX_OK);
-    CHECK(ggml_vec_index_contains(stale_writer, stale_tail_rejected_id) == 1);
+        &stale_tail_rejected_id, stale_tail_delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
+    CHECK(ggml_vec_index_contains(stale_writer, stale_tail_rejected_id) == 0);
 
     auto * stale_tail_replayed = ggml_vec_index_load_with_delta(
         stale_tail_snapshot_path.c_str(), stale_tail_delta_path.c_str());
     CHECK(stale_tail_replayed != nullptr);
-    CHECK(ggml_vec_index_len(stale_tail_replayed) == 5);
+    CHECK(ggml_vec_index_len(stale_tail_replayed) == 4);
     CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_id_a) == 1);
     CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_id_b) == 1);
-    CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_rejected_id) == 1);
+    CHECK(ggml_vec_index_contains(stale_tail_replayed, stale_tail_rejected_id) == 0);
     ggml_vec_index_free(stale_tail_replayed);
     ggml_vec_index_free(fresh_writer);
     ggml_vec_index_free(stale_writer);
@@ -993,19 +996,23 @@ int main(int argc, char ** argv) {
     thread_b.join();
     reset_fault_hooks();
 
-    CHECK(status_a == GGML_VEC_INDEX_OK);
-    CHECK(status_b == GGML_VEC_INDEX_OK);
-    CHECK(ggml_vec_index_contains(shared_a, shared_id_a) == 1);
-    CHECK(ggml_vec_index_contains(shared_b, shared_id_b) == 1);
+    CHECK((status_a == GGML_VEC_INDEX_OK && status_b == GGML_VEC_INDEX_E_IO) ||
+          (status_a == GGML_VEC_INDEX_E_IO && status_b == GGML_VEC_INDEX_OK));
+    CHECK(ggml_vec_index_contains(shared_a, shared_id_a) ==
+          (status_a == GGML_VEC_INDEX_OK ? 1 : 0));
+    CHECK(ggml_vec_index_contains(shared_b, shared_id_b) ==
+          (status_b == GGML_VEC_INDEX_OK ? 1 : 0));
 
     auto * shared_replayed = ggml_vec_index_load_with_delta(
         shared_snapshot_path.c_str(), shared_delta_path.c_str());
     CHECK(shared_replayed != nullptr);
-    CHECK(ggml_vec_index_len(shared_replayed) == 4);
+    CHECK(ggml_vec_index_len(shared_replayed) == 3);
     CHECK(ggml_vec_index_contains(shared_replayed, base_ids[0]) == 1);
     CHECK(ggml_vec_index_contains(shared_replayed, base_ids[1]) == 1);
-    CHECK(ggml_vec_index_contains(shared_replayed, shared_id_a) == 1);
-    CHECK(ggml_vec_index_contains(shared_replayed, shared_id_b) == 1);
+    CHECK(ggml_vec_index_contains(shared_replayed, shared_id_a) ==
+          (status_a == GGML_VEC_INDEX_OK ? 1 : 0));
+    CHECK(ggml_vec_index_contains(shared_replayed, shared_id_b) ==
+          (status_b == GGML_VEC_INDEX_OK ? 1 : 0));
 
     ggml_vec_index_free(shared_replayed);
     ggml_vec_index_free(shared_a);

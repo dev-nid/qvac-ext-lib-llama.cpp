@@ -443,10 +443,14 @@ static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists
         const int actual_lists = static_cast<int>(
             std::min(static_cast<size_t>(n_lists), n_live));
         const size_t dim_sz = static_cast<size_t>(dim);
+        if (dim_sz != 0 &&
+            static_cast<size_t>(actual_lists) > std::numeric_limits<size_t>::max() / dim_sz) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         test_maybe_throw_bad_alloc();
 
         std::vector<float> centroids(static_cast<size_t>(actual_lists) * dim_sz);
-        std::vector<float> next_centroids(centroids.size());
+        std::vector<double> next_centroids(centroids.size());
         std::vector<int> counts(static_cast<size_t>(actual_lists));
         std::vector<float> row(dim_sz);
         std::vector<std::vector<size_t>> lists(static_cast<size_t>(actual_lists));
@@ -466,15 +470,15 @@ static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists
         }
 
         for (int iter = 0; iter < n_iter; ++iter) {
-            std::fill(next_centroids.begin(), next_centroids.end(), 0.0f);
+            std::fill(next_centroids.begin(), next_centroids.end(), 0.0);
             std::fill(counts.begin(), counts.end(), 0);
 
             for (size_t slot : active_slots) {
                 decode_slot_to_f32(*idx, slot, row.data());
                 const size_t list = best_centroid(row.data(), centroids, actual_lists, dim);
-                float * dst = next_centroids.data() + list * dim_sz;
+                double * dst = next_centroids.data() + list * dim_sz;
                 for (int i = 0; i < dim; ++i) {
-                    dst[i] += row[static_cast<size_t>(i)];
+                    dst[i] += static_cast<double>(row[static_cast<size_t>(i)]);
                 }
                 ++counts[list];
             }
@@ -484,12 +488,13 @@ static int ggml_vec_index_build_ivf_unlocked(ggml_vec_index_t * idx, int n_lists
                 if (counts[static_cast<size_t>(list)] == 0) {
                     continue;
                 }
-                const float inv_count = 1.0f /
-                    static_cast<float>(counts[static_cast<size_t>(list)]);
-                const float * src =
+                const double inv_count = 1.0 /
+                    static_cast<double>(counts[static_cast<size_t>(list)]);
+                const double * src =
                     next_centroids.data() + static_cast<size_t>(list) * dim_sz;
                 for (int i = 0; i < dim; ++i) {
-                    centroid[i] = src[static_cast<size_t>(i)] * inv_count;
+                    centroid[i] = static_cast<float>(
+                        src[static_cast<size_t>(i)] * inv_count);
                 }
             }
         }
@@ -536,8 +541,7 @@ static int ggml_vec_index_search_impl(
     float                  * out_scores,
     uint64_t               * out_ids) {
 
-    if (idx == nullptr || queries == nullptr ||
-        out_scores == nullptr || out_ids == nullptr) {
+    if (idx == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
     if (n_q < 0 || k <= 0 ||
@@ -547,6 +551,9 @@ static int ggml_vec_index_search_impl(
     }
     if (n_q == 0) {
         return GGML_VEC_INDEX_OK;
+    }
+    if (queries == nullptr || out_scores == nullptr || out_ids == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
     }
 
     try {
@@ -684,8 +691,7 @@ int ggml_vec_index_search_ivf(
     float                  * out_scores,
     uint64_t               * out_ids) {
 
-    if (idx == nullptr || queries == nullptr ||
-        out_scores == nullptr || out_ids == nullptr) {
+    if (idx == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
     if (n_q < 0 || k <= 0 || nprobe <= 0) {
@@ -693,6 +699,9 @@ int ggml_vec_index_search_ivf(
     }
     if (n_q == 0) {
         return GGML_VEC_INDEX_OK;
+    }
+    if (queries == nullptr || out_scores == nullptr || out_ids == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
     }
 
     try {

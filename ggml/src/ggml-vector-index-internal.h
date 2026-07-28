@@ -146,6 +146,7 @@ struct ggml_vec_index {
     uint64_t generation = 0;
     uint64_t filter_cookie = 0;
     bool read_only_mmap = false;
+    bool delta_log_start_allowed = false;
     bool delta_log_bound = false;
     std::string bound_delta_log_path_key;
     bool delta_log_rebase_pending = false;
@@ -316,7 +317,7 @@ uint32_t current_delta_state(const ggml_vec_index & idx, DeltaStateKind state_ki
 DeltaStateWide current_delta_state_wide(const ggml_vec_index & idx);
 void invalidate_delta_tail_cache(ggml_vec_index & idx);
 bool bind_delta_log_path(ggml_vec_index & idx, const char * delta_path);
-bool replay_delta_log_unlocked(ggml_vec_index_t * idx, const char * delta_path);
+bool delta_log_matches_index_unlocked(const ggml_vec_index_t * idx, const char * delta_path);
 bool validate_logged_add_args(
     const ggml_vec_index_t * idx,
     const float * vectors,

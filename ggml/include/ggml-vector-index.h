@@ -105,6 +105,8 @@ GGML_API int ggml_vec_index_compact(ggml_vec_index_t * idx);
 // a durable delta record to `delta_path`. Replay the log on top of a full .tvim
 // snapshot with `ggml_vec_index_load_with_delta`.
 //
+// A new log can only start from a handle whose current state was loaded from or
+// successfully written to a snapshot. Write a new snapshot after plain mutations.
 // Delta logs are state-bound and single-writer per snapshot lineage. Use one
 // evolving writer handle for a given {snapshot, delta_path} pair. If another
 // handle or process appends to the same log, stale writers are rejected and

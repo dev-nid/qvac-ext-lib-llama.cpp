@@ -445,6 +445,8 @@ int main() {
         const uint64_t id = 1234ULL;
         CHECK(ggml_vec_index_add(idx, vector.data(), /*n=*/0, &id)
               == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_add(idx, nullptr, /*n=*/0, nullptr)
+              == GGML_VEC_INDEX_OK);
         CHECK(ggml_vec_index_len(idx) == 0);
 
         const std::string zero_delta_path =
@@ -454,6 +456,9 @@ int main() {
         std::filesystem::remove(zero_delta_path + ".lock");
         CHECK(ggml_vec_index_add_logged(
             idx, vector.data(), /*n=*/0, &id, zero_delta_path.c_str()) ==
+            GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_add_logged(
+            idx, nullptr, /*n=*/0, nullptr, zero_delta_path.c_str()) ==
             GGML_VEC_INDEX_OK);
         CHECK(ggml_vec_index_len(idx) == 0);
         CHECK(!std::filesystem::exists(zero_delta_path));
@@ -539,6 +544,9 @@ int main() {
         CHECK(ggml_vec_index_search(
             idx, seeds[0].data(), /*n_q=*/0, /*k=*/1,
             scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search(
+            idx, nullptr, /*n_q=*/0, /*k=*/1, nullptr, nullptr) ==
+            GGML_VEC_INDEX_OK);
         CHECK(scores[0] == 123.0f);
         CHECK(out_ids[0] == 1);
         CHECK(ggml_vec_index_search(
@@ -551,6 +559,10 @@ int main() {
             allowed.data(), static_cast<int>(allowed.size()),
             scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
         CHECK(ggml_vec_index_search_filtered(
+            idx, nullptr, /*n_q=*/0, /*k=*/1,
+            allowed.data(), static_cast<int>(allowed.size()), nullptr, nullptr) ==
+            GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_filtered(
             idx, seeds[0].data(), /*n_q=*/1, /*k=*/0,
             allowed.data(), static_cast<int>(allowed.size()),
             scores.data(), out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
@@ -562,6 +574,9 @@ int main() {
             idx, filter, seeds[0].data(), /*n_q=*/0, /*k=*/1,
             scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
         CHECK(ggml_vec_index_search_prepared_filtered(
+            idx, filter, nullptr, /*n_q=*/0, /*k=*/1, nullptr, nullptr) ==
+            GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_prepared_filtered(
             idx, filter, seeds[0].data(), /*n_q=*/1, /*k=*/0,
             scores.data(), out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
         ggml_vec_index_filter_free(filter);
@@ -571,6 +586,9 @@ int main() {
         CHECK(ggml_vec_index_search_ivf(
             idx, seeds[0].data(), /*n_q=*/0, /*k=*/1, /*nprobe=*/1,
             scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_ivf(
+            idx, nullptr, /*n_q=*/0, /*k=*/1, /*nprobe=*/1, nullptr, nullptr) ==
+            GGML_VEC_INDEX_OK);
         CHECK(ggml_vec_index_search_ivf(
             idx, seeds[0].data(), /*n_q=*/1, /*k=*/0, /*nprobe=*/1,
             scores.data(), out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
@@ -1289,6 +1307,9 @@ int main() {
         const std::string other_delta_path =
             (std::filesystem::temp_directory_path() /
              "ggml-vector-index-delta-other.tvid").string();
+        const std::string diverged_delta_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-delta-diverged.tvid").string();
         const std::string delta_bound_write_path =
             (std::filesystem::temp_directory_path() /
              "ggml-vector-index-delta-bound-write.tvim").string();
@@ -1299,6 +1320,8 @@ int main() {
         std::filesystem::remove(corrupt_delta_path);
         std::filesystem::remove(other_delta_path);
         std::filesystem::remove(other_delta_path + ".lock");
+        std::filesystem::remove(diverged_delta_path);
+        std::filesystem::remove(diverged_delta_path + ".lock");
         std::filesystem::remove(delta_bound_write_path);
 
         auto * base = ggml_vec_index_create(kDim, /*bit_width=*/32);
@@ -1308,6 +1331,23 @@ int main() {
         base_vecs.insert(base_vecs.end(), seeds[1].begin(), seeds[1].end());
         CHECK(ggml_vec_index_add(base, base_vecs.data(), 2, ids.data()) == GGML_VEC_INDEX_OK);
         CHECK(ggml_vec_index_write(base, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+
+        auto * diverged = ggml_vec_index_load(snapshot_path.c_str());
+        CHECK(diverged != nullptr);
+        const uint64_t diverged_plain_id = (1ULL << 41) + 4ULL;
+        const uint64_t diverged_logged_id = (1ULL << 41) + 5ULL;
+        CHECK(ggml_vec_index_add(
+            diverged, seeds[2].data(), 1, &diverged_plain_id) == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_add_logged(
+            diverged,
+            seeds[3].data(),
+            1,
+            &diverged_logged_id,
+            diverged_delta_path.c_str()) == GGML_VEC_INDEX_E_INVALID_ARG);
+        CHECK(ggml_vec_index_contains(diverged, diverged_plain_id) == 1);
+        CHECK(ggml_vec_index_contains(diverged, diverged_logged_id) == 0);
+        CHECK(!std::filesystem::exists(diverged_delta_path));
+        ggml_vec_index_free(diverged);
 
         auto * base_only = ggml_vec_index_load_with_delta(
             snapshot_path.c_str(), missing_delta_path.c_str());
@@ -1369,8 +1409,27 @@ int main() {
 
         std::vector<uint8_t> corrupt_delta = read_file_bytes(delta_path);
         const size_t first_record_offset = delta_log_header_size(corrupt_delta);
-        corrupt_delta[delta_record_state_offset(corrupt_delta, first_record_offset)] ^= 1;
+        const size_t second_record_offset =
+            delta_record_payload_offset(corrupt_delta, first_record_offset) +
+            static_cast<size_t>(read_u64_le_at(corrupt_delta, first_record_offset + 8));
+        CHECK(second_record_offset < corrupt_delta.size());
+        corrupt_delta[second_record_offset + 16] ^= 1;
         write_file_bytes(corrupt_delta_path, corrupt_delta);
+
+        auto * corrupt_stale_writer = ggml_vec_index_load(snapshot_path.c_str());
+        CHECK(corrupt_stale_writer != nullptr);
+        const uint64_t corrupt_stale_id = (1ULL << 41) + 8ULL;
+        CHECK(ggml_vec_index_add_logged(
+            corrupt_stale_writer,
+            seeds[3].data(),
+            1,
+            &corrupt_stale_id,
+            corrupt_delta_path.c_str()) == GGML_VEC_INDEX_E_IO);
+        CHECK(ggml_vec_index_len(corrupt_stale_writer) == 2);
+        CHECK(ggml_vec_index_contains(corrupt_stale_writer, delta_id) == 0);
+        CHECK(ggml_vec_index_contains(corrupt_stale_writer, corrupt_stale_id) == 0);
+        ggml_vec_index_free(corrupt_stale_writer);
+
         auto * corrupt_delta_loaded = ggml_vec_index_load_with_delta(
             snapshot_path.c_str(), corrupt_delta_path.c_str());
         CHECK(corrupt_delta_loaded == nullptr);
@@ -1557,6 +1616,18 @@ int main() {
         CHECK(replayed_with_torn_tail != nullptr);
         CHECK(ggml_vec_index_contains(replayed_with_torn_tail, delta_id) == 1);
         CHECK(ggml_vec_index_contains(replayed_with_torn_tail, post_compact_id) == 1);
+        const uint64_t post_torn_id = (1ULL << 41) + 13ULL;
+        CHECK(ggml_vec_index_add_logged(
+            replayed_with_torn_tail,
+            seeds[0].data(),
+            1,
+            &post_torn_id,
+            delta_path.c_str()) == GGML_VEC_INDEX_OK);
+        auto * replayed_after_torn_append = ggml_vec_index_load_with_delta(
+            snapshot_path.c_str(), delta_path.c_str());
+        CHECK(replayed_after_torn_append != nullptr);
+        CHECK(ggml_vec_index_contains(replayed_after_torn_append, post_torn_id) == 1);
+        ggml_vec_index_free(replayed_after_torn_append);
 
         ggml_vec_index_free(replayed_with_torn_tail);
         ggml_vec_index_free(replayed);
@@ -1567,6 +1638,8 @@ int main() {
         std::filesystem::remove(corrupt_delta_path);
         std::filesystem::remove(other_delta_path);
         std::filesystem::remove(other_delta_path + ".lock");
+        std::filesystem::remove(diverged_delta_path);
+        std::filesystem::remove(diverged_delta_path + ".lock");
         std::filesystem::remove(delta_bound_write_path);
     }
 

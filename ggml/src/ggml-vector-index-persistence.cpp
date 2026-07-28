@@ -1428,8 +1428,39 @@ static bool truncate_file_to(const char * path, uint64_t size) {
         if (!filesystem_path_from_utf8(path, fs_path)) {
             return false;
         }
-        std::filesystem::resize_file(fs_path, size);
-        return true;
+#ifdef _WIN32
+        if (size > static_cast<uint64_t>(std::numeric_limits<__int64>::max())) {
+            return false;
+        }
+        std::FILE * file = _wfopen(fs_path.c_str(), L"r+b");
+        if (file == nullptr) {
+            return false;
+        }
+        const int fd = _fileno(file);
+        const bool ok =
+            fd >= 0 &&
+            _chsize_s(fd, static_cast<__int64>(size)) == 0 &&
+            _commit(fd) == 0;
+#else
+        if (size > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+            return false;
+        }
+        std::FILE * file = std::fopen(fs_path.c_str(), "r+b");
+        if (file == nullptr) {
+            return false;
+        }
+        const int fd = ::fileno(file);
+        const bool ok =
+            fd >= 0 &&
+            ::ftruncate(fd, static_cast<off_t>(size)) == 0 &&
+#ifdef __APPLE__
+            (::fcntl(fd, F_FULLFSYNC) == 0 || ::fsync(fd) == 0);
+#else
+            ::fsync(fd) == 0;
+#endif
+#endif
+        const bool closed = std::fclose(file) == 0;
+        return ok && closed;
     } catch (...) {
         return false;
     }
@@ -1839,11 +1870,14 @@ bool validate_logged_add_args(
         const float * vectors,
         int n,
         const uint64_t * ids) {
-    if (idx == nullptr || vectors == nullptr || ids == nullptr || n < 0) {
+    if (idx == nullptr || n < 0) {
         return false;
     }
     if (n == 0) {
         return true;
+    }
+    if (vectors == nullptr || ids == nullptr) {
+        return false;
     }
     const size_t n_sz = static_cast<size_t>(n);
     const size_t dim_sz = static_cast<size_t>(idx->dim);
@@ -2168,7 +2202,11 @@ int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
         if (idx->delta_log_bound) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-        return ggml_vec_index_write_unlocked(idx, path);
+        const int status = ggml_vec_index_write_unlocked(idx, path);
+        if (status == GGML_VEC_INDEX_OK) {
+            idx->delta_log_start_allowed = true;
+        }
+        return status;
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
     }
@@ -2501,6 +2539,7 @@ ggml_vec_index_t * ggml_vec_index_load(const char * path) {
         }
 
         rebuild_state_hash(*idx);
+        idx->delta_log_start_allowed = true;
         g_last_load_error = GGML_VEC_INDEX_OK;
         return idx.release();
     } catch (const std::bad_alloc &) {
@@ -2729,6 +2768,7 @@ ggml_vec_index_t * ggml_vec_index_load_mmap(const char * path) {
         // Mmap handles are read-only snapshot views. Delta state identities are not
         // needed unless a mutable handle participates in delta-log operations.
         idx->read_only_mmap = true;
+        idx->delta_log_start_allowed = true;
         idx->mapped_source_path = path;
         idx->mapped_vector_bytes = static_cast<size_t>(vectors_bytes_u64);
         idx->mapped_file = std::move(mapped);
@@ -3216,8 +3256,38 @@ bool replay_delta_log(ggml_vec_index_t * idx, const char * delta_path) {
 
 } // namespace
 
-bool replay_delta_log_unlocked(ggml_vec_index_t * idx, const char * delta_path) {
-    return replay_delta_log(idx, delta_path);
+bool delta_log_matches_index_unlocked(
+        const ggml_vec_index_t * idx,
+        const char * delta_path) {
+    if (idx == nullptr) {
+        return false;
+    }
+    uint64_t size = 0;
+    uint32_t base_crc = 0;
+    DeltaStateWide base_wide;
+    DeltaLogFormat format = DeltaLogFormat::v4;
+    DeltaStateKind state_kind = DeltaStateKind::wide_state;
+    if (!validate_delta_header(
+            delta_path, *idx, size, format, state_kind, base_crc, base_wide)) {
+        return false;
+    }
+    const uint32_t current_crc = current_delta_state(*idx, state_kind);
+    const DeltaStateWide current_wide = current_delta_state_wide(*idx);
+    if (size == 0) {
+        return delta_state_matches(
+            state_kind, base_crc, base_wide, current_crc, current_wide);
+    }
+    uint32_t tail_crc = 0;
+    DeltaStateWide tail_wide;
+    uint64_t complete_size = 0;
+    if (!get_cached_delta_tail(
+            *idx, delta_path, state_kind, size, tail_crc, tail_wide, complete_size) &&
+        !inspect_delta_log_tail(
+            delta_path, *idx, tail_crc, tail_wide, complete_size)) {
+        return false;
+    }
+    return delta_state_matches(
+        state_kind, tail_crc, tail_wide, current_crc, current_wide);
 }
 
 int ggml_vec_index_load_with_delta_ex(
