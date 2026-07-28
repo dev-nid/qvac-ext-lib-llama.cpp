@@ -131,6 +131,10 @@ process writes to the same log, stale writers must reload from snapshot plus
 delta before appending again. Loading validates each replayed record against
 its stored post-state identity.
 
+Cross-process append protection uses cooperative OS file locks. Keep `.tvid`
+delta logs on local filesystems with reliable locking, and do not edit or append
+to them outside the vector-index API.
+
 After a handle has been loaded with a delta log or has used logged mutations,
 content changes must continue through `ggml_vec_index_add_logged`,
 `ggml_vec_index_remove_logged`, or `ggml_vec_index_compact_delta`. Plain

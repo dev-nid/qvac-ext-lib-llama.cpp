@@ -12,6 +12,7 @@
 #include <cfloat>
 #include <cfenv>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +22,7 @@
 #include <limits>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifndef _WIN32
@@ -404,6 +406,81 @@ void write_v1_index(
     write_file_bytes(path, bytes);
 }
 
+uint32_t legacy_state_crc32c_f32(
+        int dim,
+        const std::vector<float> & vectors,
+        const std::vector<uint64_t> & ids) {
+    CHECK(vectors.size() == ids.size() * static_cast<size_t>(dim));
+
+    uint32_t crc = 0xffffffffu;
+    crc = crc32c_update_u32(crc, static_cast<uint32_t>(dim));
+    crc = crc32c_update_u32(crc, 32);
+    crc = crc32c_update_u32(crc, 1);
+    crc = crc32c_update_u64(crc, static_cast<uint64_t>(ids.size()));
+    for (float value : vectors) {
+        crc = crc32c_update_u32(crc, float_bits(value));
+    }
+    for (uint64_t id : ids) {
+        crc = crc32c_update_u64(crc, id);
+    }
+    return crc ^ 0xffffffffu;
+}
+
+uint32_t f32_state_token_for(
+        int dim,
+        const std::vector<float> & vectors,
+        const std::vector<uint64_t> & ids) {
+    CHECK(vectors.size() == ids.size() * static_cast<size_t>(dim));
+
+    uint64_t hash_xor = 0;
+    uint64_t hash_sum = 0;
+    uint64_t hash_sum_rot = 0;
+    const size_t dim_sz = static_cast<size_t>(dim);
+    for (size_t row = 0; row < ids.size(); ++row) {
+        const std::vector<float> vector(
+            vectors.begin() + static_cast<std::ptrdiff_t>(row * dim_sz),
+            vectors.begin() + static_cast<std::ptrdiff_t>((row + 1) * dim_sz));
+        const uint64_t hash = slot_state_hash_f32(ids[row], vector);
+        hash_xor ^= hash;
+        hash_sum += hash;
+        hash_sum_rot += rotl64(hash, 17);
+    }
+    return f32_state_token(dim, ids.size(), hash_xor, hash_sum, hash_sum_rot);
+}
+
+std::vector<uint8_t> build_legacy_f32_delta_log(
+        uint8_t version,
+        int dim,
+        uint32_t base_state,
+        uint32_t post_state,
+        const std::vector<float> & vectors,
+        const std::vector<uint64_t> & ids) {
+    CHECK(version == 1 || version == 3);
+    CHECK(vectors.size() == ids.size() * static_cast<size_t>(dim));
+
+    std::vector<uint8_t> payload;
+    for (uint64_t id : ids) {
+        append_u64_le(payload, id);
+    }
+    for (float value : vectors) {
+        append_f32_le(payload, value);
+    }
+
+    std::vector<uint8_t> bytes = { 'T', 'V', 'D', 'L', version, 32, 0, 0 };
+    append_u32_le(bytes, static_cast<uint32_t>(dim));
+    append_u32_le(bytes, base_state);
+    const size_t record_offset = bytes.size();
+    bytes.push_back(1); // add
+    bytes.insert(bytes.end(), { 0, 0, 0 });
+    append_u32_le(bytes, static_cast<uint32_t>(ids.size()));
+    append_u64_le(bytes, payload.size());
+    append_u32_le(bytes, 0); // record CRC placeholder
+    append_u32_le(bytes, post_state);
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    refresh_delta_record_crc(bytes, record_offset);
+    return bytes;
+}
+
 template <typename Fn>
 void expect_corrupt_load_fails(
         const std::string & source_path,
@@ -592,6 +669,68 @@ int main() {
         CHECK(ggml_vec_index_search_ivf(
             idx, seeds[0].data(), /*n_q=*/1, /*k=*/0, /*nprobe=*/1,
             scores.data(), out_ids.data()) == GGML_VEC_INDEX_E_INVALID_ARG);
+    }
+
+    // Multi-query searches write independent result rows for every mode.
+    {
+        std::vector<float> batch_queries;
+        batch_queries.insert(batch_queries.end(), seeds[0].begin(), seeds[0].end());
+        batch_queries.insert(batch_queries.end(), seeds[2].begin(), seeds[2].end());
+        const std::vector<float> mixed_query = normalize({0.6f, 0.8f, 0.0f, 0.0f});
+        batch_queries.insert(batch_queries.end(), mixed_query.begin(), mixed_query.end());
+
+        std::array<float, 6> exact_scores{};
+        std::array<float, 6> filtered_scores{};
+        std::array<float, 6> prepared_scores{};
+        std::array<float, 6> ivf_scores{};
+        std::array<uint64_t, 6> exact_ids{};
+        std::array<uint64_t, 6> filtered_ids{};
+        std::array<uint64_t, 6> prepared_ids{};
+        std::array<uint64_t, 6> ivf_ids{};
+
+        CHECK(ggml_vec_index_search(
+            idx, batch_queries.data(), /*n_q=*/3, /*k=*/2,
+            exact_scores.data(), exact_ids.data()) == GGML_VEC_INDEX_OK);
+        const std::array<uint64_t, 6> expected_exact = {
+            ids[0], ids[1],
+            ids[2], ids[0],
+            ids[1], ids[0],
+        };
+        CHECK(exact_ids == expected_exact);
+        CHECK(exact_scores[0] == 1.0f);
+        CHECK(exact_scores[2] == 1.0f);
+        CHECK(exact_scores[4] > exact_scores[5]);
+
+        const std::array<uint64_t, 2> allowed = { ids[0], ids[2] };
+        CHECK(ggml_vec_index_search_filtered(
+            idx, batch_queries.data(), /*n_q=*/3, /*k=*/2,
+            allowed.data(), static_cast<int>(allowed.size()),
+            filtered_scores.data(), filtered_ids.data()) == GGML_VEC_INDEX_OK);
+        const std::array<uint64_t, 6> expected_filtered = {
+            ids[0], ids[2],
+            ids[2], ids[0],
+            ids[0], ids[2],
+        };
+        CHECK(filtered_ids == expected_filtered);
+
+        ggml_vec_index_filter_t * filter = ggml_vec_index_filter_create(
+            idx, allowed.data(), static_cast<int>(allowed.size()));
+        CHECK(filter != nullptr);
+        CHECK(ggml_vec_index_search_prepared_filtered(
+            idx, filter, batch_queries.data(), /*n_q=*/3, /*k=*/2,
+            prepared_scores.data(), prepared_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(prepared_ids == expected_filtered);
+        ggml_vec_index_filter_free(filter);
+
+        CHECK(ggml_vec_index_build_ivf(idx, /*n_lists=*/4, /*n_iter=*/2)
+              == GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_search_ivf(
+            idx, batch_queries.data(), /*n_q=*/3, /*k=*/2, /*nprobe=*/4,
+            ivf_scores.data(), ivf_ids.data()) == GGML_VEC_INDEX_OK);
+        CHECK(ivf_ids == expected_exact);
+        for (size_t i = 0; i < exact_scores.size(); ++i) {
+            CHECK(std::fabs(ivf_scores[i] - exact_scores[i]) < 1e-5f);
+        }
     }
 
     // Non-finite queries are rejected before search.
@@ -2053,6 +2192,80 @@ int main() {
         ggml_vec_index_free(q4);
     }
 
+    // Quantized multi-query searches exercise SIMD-sized rows and top-k ranking.
+    {
+        constexpr int quant_dim = 17;
+        const std::vector<std::vector<float>> quant_vectors = {
+            normalize({ 1.0f, 0.5f, -0.25f, 0.125f, 0.0f, -0.75f, 0.625f, -0.5f,
+                        0.375f, -0.25f, 0.125f, 0.0f, -0.125f, 0.25f, -0.375f, 0.5f, -0.625f }),
+            normalize({ -0.5f, 1.0f, 0.75f, -0.625f, 0.5f, -0.375f, 0.25f, -0.125f,
+                        0.0f, 0.125f, -0.25f, 0.375f, -0.5f, 0.625f, -0.75f, 0.875f, -1.0f }),
+            normalize({ 0.25f, -0.5f, 1.0f, 0.875f, -0.75f, 0.625f, -0.5f, 0.375f,
+                        -0.25f, 0.125f, 0.0f, -0.125f, 0.25f, -0.375f, 0.5f, -0.625f, 0.75f }),
+        };
+        const std::vector<std::vector<float>> quant_queries = {
+            normalize({ 0.9f, 0.4f, -0.2f, 0.1f, 0.0f, -0.7f, 0.6f, -0.45f,
+                        0.3f, -0.2f, 0.1f, 0.0f, -0.1f, 0.2f, -0.3f, 0.4f, -0.5f }),
+            normalize({ 0.1f, -0.3f, 0.8f, 0.7f, -0.6f, 0.5f, -0.4f, 0.3f,
+                        -0.2f, 0.1f, 0.0f, -0.1f, 0.2f, -0.3f, 0.4f, -0.5f, 0.6f }),
+        };
+        const std::array<uint64_t, 3> quant_ids = { 8801001ULL, 8801002ULL, 8801003ULL };
+        std::vector<float> quant_rows;
+        std::vector<float> quant_query_rows;
+        for (const auto & vector : quant_vectors) {
+            quant_rows.insert(quant_rows.end(), vector.begin(), vector.end());
+        }
+        for (const auto & query : quant_queries) {
+            quant_query_rows.insert(quant_query_rows.end(), query.begin(), query.end());
+        }
+
+        for (int bit_width : { 8, 4 }) {
+            auto * quant_idx = ggml_vec_index_create(quant_dim, bit_width);
+            CHECK(quant_idx != nullptr);
+            CHECK(ggml_vec_index_add(
+                quant_idx,
+                quant_rows.data(),
+                static_cast<int>(quant_ids.size()),
+                quant_ids.data()) == GGML_VEC_INDEX_OK);
+
+            std::array<float, 4> scores{};
+            std::array<uint64_t, 4> out_ids{};
+            CHECK(ggml_vec_index_search(
+                quant_idx, quant_query_rows.data(), /*n_q=*/2, /*k=*/2,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+
+            for (size_t q = 0; q < quant_queries.size(); ++q) {
+                std::vector<std::pair<float, uint64_t>> expected;
+                for (size_t row = 0; row < quant_vectors.size(); ++row) {
+                    const float score = bit_width == 8 ?
+                        q8_dot_reference(quant_vectors[row], quant_queries[q]) :
+                        q4_dot_reference(quant_vectors[row], quant_queries[q]);
+                    expected.push_back({ score, quant_ids[row] });
+                }
+                std::sort(
+                    expected.begin(),
+                    expected.end(),
+                    [](const std::pair<float, uint64_t> & a,
+                       const std::pair<float, uint64_t> & b) {
+                        if (a.first != b.first) {
+                            return a.first > b.first;
+                        }
+                        return a.second < b.second;
+                    });
+
+                for (size_t i = 0; i < 2; ++i) {
+                    const size_t out = q * 2 + i;
+                    CHECK(out_ids[out] == expected[i].second);
+                    const float tolerance =
+                        1e-5f * std::max(1.0f, std::fabs(expected[i].first));
+                    CHECK(std::fabs(scores[out] - expected[i].first) <= tolerance);
+                }
+            }
+
+            ggml_vec_index_free(quant_idx);
+        }
+    }
+
     // Quantization must not depend on the caller's active rounding mode.
     {
         const int saved_rounding_mode = std::fegetround();
@@ -2137,6 +2350,71 @@ int main() {
             std::filesystem::remove(delta_path + ".lock");
         }
         CHECK(std::fesetround(saved_rounding_mode) == 0);
+    }
+
+    // Legacy v1/v3 delta logs remain replayable for f32 snapshots.
+    {
+        const std::string snapshot_path =
+            (std::filesystem::temp_directory_path() /
+             "ggml-vector-index-legacy-delta-base.tvim").string();
+        std::filesystem::remove(snapshot_path);
+
+        const std::vector<uint64_t> base_ids = {
+            9001001ULL,
+            9001002ULL,
+        };
+        std::vector<float> base_vectors;
+        base_vectors.insert(base_vectors.end(), seeds[0].begin(), seeds[0].end());
+        base_vectors.insert(base_vectors.end(), seeds[1].begin(), seeds[1].end());
+        const uint64_t delta_id = 9001003ULL;
+        std::vector<float> delta_vectors;
+        delta_vectors.insert(delta_vectors.end(), seeds[2].begin(), seeds[2].end());
+        std::vector<uint64_t> post_ids = base_ids;
+        post_ids.push_back(delta_id);
+        std::vector<float> post_vectors = base_vectors;
+        post_vectors.insert(post_vectors.end(), delta_vectors.begin(), delta_vectors.end());
+
+        auto * base = ggml_vec_index_create(kDim, /*bit_width=*/32);
+        CHECK(base != nullptr);
+        CHECK(ggml_vec_index_add(
+            base, base_vectors.data(), static_cast<int>(base_ids.size()), base_ids.data()) ==
+            GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(base, snapshot_path.c_str()) == GGML_VEC_INDEX_OK);
+        ggml_vec_index_free(base);
+
+        for (uint8_t version : { static_cast<uint8_t>(1), static_cast<uint8_t>(3) }) {
+            const std::string delta_path =
+                (std::filesystem::temp_directory_path() /
+                 ("ggml-vector-index-legacy-delta-v" + std::to_string(version) + ".tvid")).string();
+            std::filesystem::remove(delta_path);
+
+            const uint32_t base_state = version == 1 ?
+                legacy_state_crc32c_f32(kDim, base_vectors, base_ids) :
+                f32_state_token_for(kDim, base_vectors, base_ids);
+            const uint32_t post_state = version == 1 ?
+                legacy_state_crc32c_f32(kDim, post_vectors, post_ids) :
+                f32_state_token_for(kDim, post_vectors, post_ids);
+            const std::vector<uint8_t> delta_log = build_legacy_f32_delta_log(
+                version, kDim, base_state, post_state, delta_vectors, { delta_id });
+            write_file_bytes(delta_path, delta_log);
+
+            auto * replayed = ggml_vec_index_load_with_delta(
+                snapshot_path.c_str(), delta_path.c_str());
+            CHECK(replayed != nullptr);
+            CHECK(ggml_vec_index_len(replayed) == 3);
+            CHECK(ggml_vec_index_contains(replayed, delta_id) == 1);
+            std::array<float, 1> scores{};
+            std::array<uint64_t, 1> out_ids{};
+            CHECK(ggml_vec_index_search(
+                replayed, seeds[2].data(), 1, /*k=*/1,
+                scores.data(), out_ids.data()) == GGML_VEC_INDEX_OK);
+            CHECK(out_ids[0] == delta_id);
+
+            ggml_vec_index_free(replayed);
+            std::filesystem::remove(delta_path);
+        }
+
+        std::filesystem::remove(snapshot_path);
     }
 
     // Delta replay keeps quantized storage quantized. New v4 logs store native
