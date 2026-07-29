@@ -1,318 +1,234 @@
-// ggml-vector-index.cpp - POC scalar implementation of the fabric vector
+// ggml-vector-index.cpp - CPU implementation of the vector
 // index C API declared in `ggml/include/ggml-vector-index.h`.
 //
-// Storage: full f32 vectors as a contiguous std::vector<float>. ID map uses
-// std::unordered_map<uint64_t, size_t> for lookup and a parallel vector for
-// the slot->id reverse map. Remove uses swap-with-last.
-//
-// Search: naive scalar dot product across all slots + min-heap of size k.
-// No SIMD, no GPU. Correctness over speed; the optimization phase will swap
-// the storage layout and kernel without touching the C API.
+// Storage: full f32 vectors or per-vector symmetric q8/q4 codes. Search and
+// persistence live in companion translation units.
 
-#include "ggml-vector-index.h"
+#include "ggml-vector-index-internal.h"
 
-#include <algorithm>
-#include <atomic>
-#include <cfloat>
-#include <chrono>
-#include <cmath>
-#include <cstdio>
-#include <cstdint>
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <limits>
-#include <memory>
-#include <new>
-#include <queue>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
+static std::atomic<uint64_t> g_next_filter_cookie{ 1 };
 
-#ifdef _WIN32
-#    ifndef WIN32_LEAN_AND_MEAN
-#        define WIN32_LEAN_AND_MEAN
-#    endif
-#    ifndef NOMINMAX
-#        define NOMINMAX
-#    endif
-#    include <windows.h>
-#    include <fcntl.h>
-#    include <io.h>
-#else
-#    include <fcntl.h>
-#    include <unistd.h>
-#endif
+void invalidate_ivf(ggml_vec_index & idx) {
+    idx.ivf_generation = std::numeric_limits<uint64_t>::max();
+    idx.ivf_n_lists = 0;
+    idx.ivf_centroids.clear();
+    idx.ivf_lists.clear();
+}
 
-namespace {
+bool is_q8(const ggml_vec_index & idx) {
+    return idx.bit_width == 8;
+}
 
-constexpr uint8_t  kTvimMagic[4]   = { 'T', 'V', 'P', 'I' };
-constexpr uint8_t  kTvimVersion    = 1;
-constexpr size_t   kTvimHeaderSize = 16;
-constexpr uint64_t kPaddingId      = UINT64_MAX;
+bool is_q4(const ggml_vec_index & idx) {
+    return idx.bit_width == 4;
+}
 
-static_assert(sizeof(float) == sizeof(uint32_t) && std::numeric_limits<float>::is_iec559,
-              "ggml-vector-index requires IEEE 754 float32");
+bool is_quantized(const ggml_vec_index & idx) {
+    return is_q4(idx) || is_q8(idx);
+}
 
-bool checked_mul_size(size_t a, size_t b, size_t & out) {
-    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
-        return false;
+uint8_t storage_kind(const ggml_vec_index & idx) {
+    return is_q4(idx) ? kStorageQ4 : (is_q8(idx) ? kStorageQ8 : kStorageF32);
+}
+
+size_t q4_row_bytes(size_t dim) {
+    return (dim + 1) / 2;
+}
+
+size_t vector_bytes(const ggml_vec_index & idx) {
+    const size_t n = idx.slot_to_id.size();
+    const size_t dim_sz = static_cast<size_t>(idx.dim);
+    if (is_q4(idx)) {
+        return n * q4_row_bytes(dim_sz);
     }
-    out = a * b;
-    return true;
-}
-
-bool checked_add_size(size_t a, size_t b, size_t & out) {
-    if (b > std::numeric_limits<size_t>::max() - a) {
-        return false;
+    if (is_q8(idx)) {
+        return n * dim_sz * sizeof(int8_t);
     }
-    out = a + b;
-    return true;
+    return n * dim_sz * sizeof(float);
 }
 
-bool all_finite(const float * values, size_t n) {
-    for (size_t i = 0; i < n; ++i) {
-        if (!std::isfinite(values[i])) {
-            return false;
-        }
+bool slot_is_active(const ggml_vec_index & idx, size_t slot) {
+    return slot < idx.slot_active.size() && idx.slot_active[slot] != 0;
+}
+
+size_t active_count(const ggml_vec_index & idx) {
+    return idx.n_active;
+}
+
+const float * f32_data_ptr(const ggml_vec_index & idx) {
+    return idx.mapped_data != nullptr ? idx.mapped_data : idx.data.data();
+}
+
+const int8_t * q8_data_ptr(const ggml_vec_index & idx) {
+    return idx.mapped_q8_data != nullptr ? idx.mapped_q8_data : idx.q8_data.data();
+}
+
+const uint8_t * q4_data_ptr(const ggml_vec_index & idx) {
+    return idx.mapped_q4_data != nullptr ? idx.mapped_q4_data : idx.q4_data.data();
+}
+
+bool has_vector_storage(const ggml_vec_index & idx) {
+    const size_t bytes = vector_bytes(idx);
+    if (idx.read_only_mmap) {
+        return idx.mapped_vector_bytes == bytes &&
+            (bytes == 0 ||
+             idx.mapped_data != nullptr ||
+             idx.mapped_q8_data != nullptr ||
+             idx.mapped_q4_data != nullptr);
     }
-    return true;
-}
-
-float float_score_from_double(double score) {
-    if (!std::isfinite(score)) {
-        return score < 0.0 ? -FLT_MAX : FLT_MAX;
+    if (is_q4(idx)) {
+        return idx.q4_data.size() == bytes;
     }
-    if (score > static_cast<double>(FLT_MAX)) {
-        return FLT_MAX;
+    if (is_q8(idx)) {
+        return idx.q8_data.size() == bytes;
     }
-    if (score < -static_cast<double>(FLT_MAX)) {
-        return -FLT_MAX;
+    return idx.data.size() == bytes / sizeof(float);
+}
+
+static uint8_t q4_encode(int q) {
+    return static_cast<uint8_t>(q + 8);
+}
+
+int q4_decode(uint8_t nibble) {
+    return static_cast<int>(nibble) - 8;
+}
+
+static int round_nearest_even(float value) {
+    const float lower_f = std::floor(value);
+    const float upper_f = lower_f + 1.0f;
+    const float lower_dist = value - lower_f;
+    const float upper_dist = upper_f - value;
+    if (lower_dist < upper_dist) {
+        return static_cast<int>(lower_f);
     }
-    return static_cast<float>(score);
+    if (upper_dist < lower_dist) {
+        return static_cast<int>(upper_f);
+    }
+
+    const int lower = static_cast<int>(lower_f);
+    return (lower % 2) == 0 ? lower : static_cast<int>(upper_f);
 }
 
-bool expected_snapshot_size(size_t n, size_t dim, size_t & expected) {
-    size_t values        = 0;
-    size_t vector_bytes  = 0;
-    size_t id_bytes      = 0;
-    size_t payload_bytes = 0;
-    return checked_mul_size(n, dim, values) && checked_mul_size(values, sizeof(float), vector_bytes) &&
-           checked_mul_size(n, sizeof(uint64_t), id_bytes) && checked_add_size(vector_bytes, id_bytes, payload_bytes) &&
-           checked_add_size(kTvimHeaderSize, payload_bytes, expected);
-}
-
-uint64_t process_id() {
-#ifdef _WIN32
-    return static_cast<uint64_t>(GetCurrentProcessId());
-#else
-    return static_cast<uint64_t>(getpid());
-#endif
-}
-
-std::filesystem::path make_tmp_path(const std::filesystem::path & dst_path) {
-    static std::atomic<uint32_t> counter{ 0 };
-
-    const uint32_t count = counter.fetch_add(1, std::memory_order_relaxed);
-    const uint64_t ticks = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-
-    std::filesystem::path tmp_path = dst_path;
-    tmp_path += ".tmp.";
-    tmp_path += std::to_string(process_id());
-    tmp_path += ".";
-    tmp_path += std::to_string(count);
-    tmp_path += ".";
-    tmp_path += std::to_string(ticks);
-    return tmp_path;
-}
-
-struct tmp_file_guard {
-    explicit tmp_file_guard(const std::filesystem::path & path) : path(path) {}
-
-    ~tmp_file_guard() {
-        if (active) {
-            std::error_code ec;
-            std::filesystem::remove(path, ec);
+class ScopedNearestRounding {
+public:
+    ScopedNearestRounding() : saved_rounding(std::fegetround()) {
+        if (saved_rounding != FE_TONEAREST && saved_rounding != -1) {
+            std::fesetround(FE_TONEAREST);
         }
     }
 
-    void dismiss() { active = false; }
+    ~ScopedNearestRounding() {
+        if (saved_rounding != FE_TONEAREST && saved_rounding != -1) {
+            std::fesetround(saved_rounding);
+        }
+    }
 
-    std::filesystem::path path;
-    bool                  active = true;
+    ScopedNearestRounding(const ScopedNearestRounding &) = delete;
+    ScopedNearestRounding & operator=(const ScopedNearestRounding &) = delete;
+
+private:
+    int saved_rounding = FE_TONEAREST;
 };
 
-bool replace_file(const std::filesystem::path & tmp_path, const std::filesystem::path & dst_path) {
-#ifdef _WIN32
-    const std::wstring tmp_native = tmp_path.wstring();
-    const std::wstring dst_native = dst_path.wstring();
-    return MoveFileExW(tmp_native.c_str(), dst_native.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-#else
-    std::error_code ec;
-    std::filesystem::rename(tmp_path, dst_path, ec);
-    return !ec;
-#endif
-}
+void quantize_q8_row(const float * src, int8_t * dst, int dim, float & scale) {
+    const ScopedNearestRounding rounding_guard;
 
-std::FILE * open_exclusive(const std::filesystem::path & path) {
-#ifdef _WIN32
-    const HANDLE handle =
-        CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
-        return nullptr;
+    if (dim <= 0) {
+        scale = 1.0f;
+        return;
     }
-    const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_BINARY | _O_WRONLY);
-    if (fd == -1) {
-        CloseHandle(handle);
-        return nullptr;
-    }
-    std::FILE * file = _fdopen(fd, "wb");
-    if (file == nullptr) {
-        _close(fd);
-    }
-    return file;
-#else
-    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
-    if (fd == -1) {
-        return nullptr;
-    }
-    std::FILE * file = fdopen(fd, "wb");
-    if (file == nullptr) {
-        close(fd);
-    }
-    return file;
-#endif
-}
+    const size_t dim_sz = static_cast<size_t>(dim);
 
-bool copy_permissions_if_exists(const std::filesystem::path & src_path, const std::filesystem::path & dst_path) {
-    std::error_code                    ec;
-    const std::filesystem::file_status src_status = std::filesystem::status(src_path, ec);
-    if (ec) {
-        std::error_code exists_ec;
-        const bool      src_exists = std::filesystem::exists(src_path, exists_ec);
-        return !exists_ec && !src_exists;
-    }
-    if (!std::filesystem::exists(src_status)) {
-        return true;
+    float max_abs = 0.0f;
+    for (int i = 0; i < dim; ++i) {
+        max_abs = std::max(max_abs, std::fabs(src[i]));
     }
 
-    std::filesystem::permissions(dst_path, src_status.permissions(), std::filesystem::perm_options::replace, ec);
-    return !ec;
-}
+    if (max_abs == 0.0f) {
+        scale = 1.0f;
+        std::memset(dst, 0, dim_sz);
+        return;
+    }
 
-void put_u32_le(uint8_t * dst, uint32_t v) {
-    dst[0] = static_cast<uint8_t>(v >> 0);
-    dst[1] = static_cast<uint8_t>(v >> 8);
-    dst[2] = static_cast<uint8_t>(v >> 16);
-    dst[3] = static_cast<uint8_t>(v >> 24);
-}
-
-void put_u64_le(uint8_t * dst, uint64_t v) {
-    for (int i = 0; i < 8; ++i) {
-        dst[i] = static_cast<uint8_t>(v >> (8 * i));
+    scale = max_abs / 127.0f;
+    if (scale == 0.0f) {
+        scale = max_abs;
+    }
+    for (int i = 0; i < dim; ++i) {
+        const float scaled = src[i] / scale;
+        int q = round_nearest_even(scaled);
+        q = std::max(-127, std::min(127, q));
+        dst[i] = static_cast<int8_t>(q);
     }
 }
 
-uint32_t get_u32_le(const uint8_t * src) {
-    return (static_cast<uint32_t>(src[0]) << 0) | (static_cast<uint32_t>(src[1]) << 8) |
-           (static_cast<uint32_t>(src[2]) << 16) | (static_cast<uint32_t>(src[3]) << 24);
-}
+void quantize_q4_row(const float * src, uint8_t * dst, int dim, float & scale) {
+    const ScopedNearestRounding rounding_guard;
 
-uint64_t get_u64_le(const uint8_t * src) {
-    uint64_t v = 0;
-    for (int i = 0; i < 8; ++i) {
-        v |= static_cast<uint64_t>(src[i]) << (8 * i);
+    float max_abs = 0.0f;
+    for (int i = 0; i < dim; ++i) {
+        max_abs = std::max(max_abs, std::fabs(src[i]));
     }
-    return v;
-}
 
-uint32_t float_to_u32(float v) {
-    uint32_t bits;
-    std::memcpy(&bits, &v, sizeof(bits));
-    return bits;
-}
-
-float u32_to_float(uint32_t bits) {
-    float v;
-    std::memcpy(&v, &bits, sizeof(v));
-    return v;
-}
-
-bool write_u32_le(std::FILE * f, uint32_t v) {
-    uint8_t bytes[4];
-    put_u32_le(bytes, v);
-    return std::fwrite(bytes, 1, sizeof(bytes), f) == sizeof(bytes);
-}
-
-bool write_u64_le(std::FILE * f, uint64_t v) {
-    uint8_t bytes[8];
-    put_u64_le(bytes, v);
-    return std::fwrite(bytes, 1, sizeof(bytes), f) == sizeof(bytes);
-}
-
-bool read_u32_le(std::ifstream & f, uint32_t & v) {
-    uint8_t bytes[4];
-    f.read(reinterpret_cast<char *>(bytes), sizeof(bytes));
-    if (!f) {
-        return false;
+    std::memset(dst, 0x88, q4_row_bytes(static_cast<size_t>(dim)));
+    if (max_abs == 0.0f) {
+        scale = 1.0f;
+        return;
     }
-    v = get_u32_le(bytes);
-    return true;
-}
 
-bool read_u64_le(std::ifstream & f, uint64_t & v) {
-    uint8_t bytes[8];
-    f.read(reinterpret_cast<char *>(bytes), sizeof(bytes));
-    if (!f) {
-        return false;
+    scale = max_abs / 7.0f;
+    if (scale == 0.0f) {
+        scale = max_abs;
     }
-    v = get_u64_le(bytes);
-    return true;
-}
-
-// Top-k via min-heap of (score, id). The heap holds at most `k` candidates;
-// each new score is compared against the smallest in the heap.
-struct score_id {
-    float    score;
-    uint64_t id;
-};
-
-struct score_id_min_heap_cmp {
-    bool operator()(const score_id & a, const score_id & b) const {
-        // Min-heap by score (smallest score at the top).
-        return a.score > b.score;
+    for (int i = 0; i < dim; ++i) {
+        const float scaled = src[i] / scale;
+        int q = round_nearest_even(scaled);
+        q = std::max(-7, std::min(7, q));
+        const uint8_t code = q4_encode(q);
+        uint8_t & byte = dst[static_cast<size_t>(i) / 2];
+        if ((i & 1) == 0) {
+            byte = static_cast<uint8_t>((byte & 0xf0u) | code);
+        } else {
+            byte = static_cast<uint8_t>((byte & 0x0fu) | (code << 4));
+        }
     }
-};
-
-}  // namespace
-
-// Lifetime-managed instance state. Lives behind the opaque
-// `ggml_vec_index_t` typedef.
-struct ggml_vec_index {
-    int dim       = 0;
-    int bit_width = 32;
-
-    // Flat row-major storage: `data[slot * dim + i]` is component i of vec slot.
-    std::vector<float> data;
-
-    // slot -> external id (parallel to logical slot index).
-    std::vector<uint64_t> slot_to_id;
-
-    // external id -> slot.
-    std::unordered_map<uint64_t, size_t> id_to_slot;
-};
+}
 
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
+
+const char * ggml_vec_index_error_to_string(int error) {
+    switch (error) {
+        case GGML_VEC_INDEX_OK:
+            return "ok";
+        case GGML_VEC_INDEX_E_INVALID_ARG:
+            return "invalid argument";
+        case GGML_VEC_INDEX_E_DUPLICATE:
+            return "duplicate id";
+        case GGML_VEC_INDEX_E_IO:
+            return "I/O or corrupt data";
+        case GGML_VEC_INDEX_E_BAD_MAGIC:
+            return "bad magic";
+        case GGML_VEC_INDEX_E_BAD_VERSION:
+            return "bad version";
+        case GGML_VEC_INDEX_E_OOM:
+            return "out of memory";
+        case GGML_VEC_INDEX_E_PARTIAL_COMPACT:
+            return "partial compaction";
+        case GGML_VEC_INDEX_E_INTERNAL:
+            return "internal error";
+        default:
+            return "unknown error";
+    }
+}
 
 ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width) {
     try {
         if (dim <= 0) {
             return nullptr;
         }
-        if (bit_width != 32) {
+        if (!is_supported_bit_width(bit_width)) {
             return nullptr;
         }
         auto * idx = new (std::nothrow) ggml_vec_index();
@@ -321,6 +237,10 @@ ggml_vec_index_t * ggml_vec_index_create(int dim, int bit_width) {
         }
         idx->dim       = dim;
         idx->bit_width = bit_width;
+        idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
+        if (idx->filter_cookie == 0) {
+            idx->filter_cookie = g_next_filter_cookie.fetch_add(1, std::memory_order_relaxed);
+        }
         return idx;
     } catch (...) {
         return nullptr;
@@ -335,10 +255,49 @@ void ggml_vec_index_free(ggml_vec_index_t * idx) {
 // Mutation
 // ---------------------------------------------------------------------------
 
-int ggml_vec_index_add(ggml_vec_index_t * idx, const float * vectors, int n, const uint64_t * ids) {
+void rollback_appended_slots_unlocked(
+        ggml_vec_index_t * idx,
+        size_t base_slot,
+        const uint64_t * ids,
+        int n) noexcept {
+    if (idx == nullptr) {
+        return;
+    }
+    for (int i = 0; i < n; ++i) {
+        idx->id_to_slot.erase(ids[i]);
+    }
+    const size_t dim_sz = static_cast<size_t>(idx->dim);
+    if (is_q4(*idx)) {
+        idx->q4_data.resize(base_slot * q4_row_bytes(dim_sz));
+        idx->q4_scale.resize(base_slot);
+    } else if (is_q8(*idx)) {
+        idx->q8_data.resize(base_slot * dim_sz);
+        idx->q8_scale.resize(base_slot);
+    } else {
+        idx->data.resize(base_slot * dim_sz);
+    }
+    idx->slot_to_id.resize(base_slot);
+    idx->slot_active.resize(base_slot);
+    idx->n_active = idx->id_to_slot.size();
+}
+
+int ggml_vec_index_add_unlocked(
+    ggml_vec_index_t * idx,
+    const float      * vectors,
+    int                n,
+    const uint64_t   * ids,
+    bool               finalize) {
+
     size_t base_slot = 0;
     size_t dim_sz    = 0;
-    bool   resized   = false;
+    bool resized     = false;
+
+    auto rollback = [&]() noexcept {
+        if (idx == nullptr || !resized) {
+            return;
+        }
+        rollback_appended_slots_unlocked(idx, base_slot, ids, n);
+    };
 
     try {
         if (idx == nullptr) {
@@ -350,30 +309,20 @@ int ggml_vec_index_add(ggml_vec_index_t * idx, const float * vectors, int n, con
         if (n == 0) {
             return GGML_VEC_INDEX_OK;
         }
-        if (vectors == nullptr || ids == nullptr) {
+        if (vectors == nullptr || ids == nullptr || idx->read_only_mmap) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
-
-        dim_sz            = static_cast<size_t>(idx->dim);
-        const size_t n_sz = static_cast<size_t>(n);
-        if (idx->slot_to_id.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
-            n_sz > static_cast<size_t>(std::numeric_limits<int>::max()) - idx->slot_to_id.size()) {
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
-        size_t value_count = 0;
-        if (!checked_mul_size(n_sz, dim_sz, value_count)) {
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
-        if (!all_finite(vectors, value_count)) {
+        if (finalize && idx->delta_log_bound) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
         // Atomic add: detect duplicates first (against existing AND in-batch),
         // bail before mutating any state.
+        test_maybe_throw_bad_alloc();
         std::unordered_set<uint64_t> batch_ids;
-        batch_ids.reserve(n_sz);
+        batch_ids.reserve(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) {
-            if (ids[i] == kPaddingId) {
+            if (!is_valid_id(ids[i])) {
                 return GGML_VEC_INDEX_E_INVALID_ARG;
             }
             if (idx->id_to_slot.find(ids[i]) != idx->id_to_slot.end()) {
@@ -385,6 +334,11 @@ int ggml_vec_index_add(ggml_vec_index_t * idx, const float * vectors, int n, con
         }
 
         base_slot = idx->slot_to_id.size();
+        dim_sz    = static_cast<size_t>(idx->dim);
+        const size_t n_sz = static_cast<size_t>(n);
+        if (n_sz > kMaxIndexLen || active_count(*idx) > kMaxIndexLen - n_sz) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
         if (n_sz > std::numeric_limits<size_t>::max() - base_slot) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
@@ -392,360 +346,270 @@ int ggml_vec_index_add(ggml_vec_index_t * idx, const float * vectors, int n, con
         if (dim_sz != 0 && new_slots > std::numeric_limits<size_t>::max() / dim_sz) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
+        if (!all_finite(vectors, n_sz * dim_sz)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
 
-        idx->data.resize(new_slots * dim_sz);
         resized = true;
+        if (is_q4(*idx)) {
+            idx->q4_data.resize(new_slots * q4_row_bytes(dim_sz));
+            idx->q4_scale.resize(new_slots);
+        } else if (is_q8(*idx)) {
+            idx->q8_data.resize(new_slots * dim_sz);
+            idx->q8_scale.resize(new_slots);
+        } else {
+            idx->data.resize(new_slots * dim_sz);
+        }
         idx->slot_to_id.resize(new_slots);
+        idx->slot_active.resize(new_slots, 0);
+        test_maybe_throw_bad_alloc();
         idx->id_to_slot.reserve(new_slots);
 
         for (int i = 0; i < n; ++i) {
             const size_t slot = base_slot + static_cast<size_t>(i);
-            std::memcpy(idx->data.data() + slot * dim_sz, vectors + static_cast<size_t>(i) * dim_sz,
-                        dim_sz * sizeof(float));
+            const float * src = vectors + static_cast<size_t>(i) * dim_sz;
+            if (is_q4(*idx)) {
+                quantize_q4_row(
+                    src,
+                    idx->q4_data.data() + slot * q4_row_bytes(dim_sz),
+                    idx->dim,
+                    idx->q4_scale[slot]);
+            } else if (is_q8(*idx)) {
+                quantize_q8_row(
+                    src,
+                    idx->q8_data.data() + slot * dim_sz,
+                    idx->dim,
+                    idx->q8_scale[slot]);
+            } else {
+                std::memcpy(
+                    idx->data.data() + slot * dim_sz,
+                    src,
+                    dim_sz * sizeof(float));
+            }
             idx->slot_to_id[slot] = ids[i];
+            idx->slot_active[slot] = 1;
+            test_maybe_throw_bad_alloc();
             idx->id_to_slot.emplace(ids[i], slot);
         }
-    } catch (const std::bad_alloc &) {
-        if (idx != nullptr && resized) {
-            for (int i = 0; i < n; ++i) {
-                idx->id_to_slot.erase(ids[i]);
-            }
-            idx->data.resize(base_slot * dim_sz);
-            idx->slot_to_id.resize(base_slot);
+        idx->n_active += n_sz;
+        for (size_t slot = base_slot; slot < new_slots; ++slot) {
+            add_state_hash(*idx, slot_state_hash(*idx, slot));
         }
+        if (finalize) {
+            ++idx->generation;
+            invalidate_ivf(*idx);
+            idx->delta_log_start_allowed = false;
+        }
+    } catch (const std::bad_alloc &) {
+        rollback();
         return GGML_VEC_INDEX_E_OOM;
     } catch (...) {
-        if (idx != nullptr && resized) {
-            for (int i = 0; i < n; ++i) {
-                idx->id_to_slot.erase(ids[i]);
-            }
-            idx->data.resize(base_slot * dim_sz);
-            idx->slot_to_id.resize(base_slot);
-        }
+        rollback();
         return GGML_VEC_INDEX_E_INTERNAL;
     }
     return GGML_VEC_INDEX_OK;
 }
 
-int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id) {
+int ggml_vec_index_add(
+    ggml_vec_index_t * idx,
+    const float      * vectors,
+    int                n,
+    const uint64_t   * ids) {
+    if (idx == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
     try {
-        if (idx == nullptr || id == kPaddingId) {
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        return ggml_vec_index_add_unlocked(idx, vectors, n, ids, true);
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+int ggml_vec_index_remove_unlocked(
+        ggml_vec_index_t * idx,
+        uint64_t id,
+        bool allow_delta_bound) {
+    try {
+        if (idx == nullptr) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (!is_valid_id(id)) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (idx->read_only_mmap) {
             return GGML_VEC_INDEX_E_INVALID_ARG;
         }
         auto it = idx->id_to_slot.find(id);
         if (it == idx->id_to_slot.end()) {
             return 0;
         }
-        const size_t slot   = it->second;
-        const size_t last   = idx->slot_to_id.size() - 1;
-        const size_t dim_sz = static_cast<size_t>(idx->dim);
-
-        if (slot != last) {
-            // Move last vector into the freed slot and update its id mapping.
-            std::memcpy(idx->data.data() + slot * dim_sz, idx->data.data() + last * dim_sz, dim_sz * sizeof(float));
-            const uint64_t moved_id   = idx->slot_to_id[last];
-            idx->slot_to_id[slot]     = moved_id;
-            idx->id_to_slot[moved_id] = slot;
+        const size_t slot = it->second;
+        if (!slot_is_active(*idx, slot)) {
+            idx->id_to_slot.erase(it);
+            return 0;
         }
-
-        idx->slot_to_id.pop_back();
-        idx->data.resize(last * dim_sz);
+        if (idx->delta_log_bound && !allow_delta_bound) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        remove_state_hash(*idx, slot_state_hash(*idx, slot));
+        idx->slot_active[slot] = 0;
+        --idx->n_active;
         idx->id_to_slot.erase(it);
+        ++idx->generation;
+        invalidate_ivf(*idx);
+        if (!allow_delta_bound) {
+            idx->delta_log_start_allowed = false;
+        }
         return 1;
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
     }
 }
 
-int ggml_vec_index_contains(const ggml_vec_index_t * idx, uint64_t id) {
-    if (idx == nullptr) {
-        return 0;
-    }
-    return idx->id_to_slot.count(id) != 0 ? 1 : 0;
-}
-
-void ggml_vec_index_prepare(ggml_vec_index_t * /*idx*/) {
-    // POC no-op. Future: warm caches, materialize codebooks, etc.
-}
-
-// ---------------------------------------------------------------------------
-// Search
-// ---------------------------------------------------------------------------
-
-namespace {
-
-// Scalar dot product of two `dim`-length f32 vectors.
-inline float dot(const float * a, const float * b, int dim) {
-    double acc = 0.0;
-    for (int i = 0; i < dim; ++i) {
-        acc += static_cast<double>(a[i]) * static_cast<double>(b[i]);
-    }
-    return float_score_from_double(acc);
-}
-
-// Run a single query against all slots, write top-k into out_scores/out_ids.
-// If the index holds fewer than k entries, pad with sentinels.
-void search_one(const ggml_vec_index_t & idx, const float * query, int k, float * out_scores, uint64_t * out_ids) {
-    const int    dim     = idx.dim;
-    const size_t n_slots = idx.slot_to_id.size();
-
-    std::priority_queue<score_id, std::vector<score_id>, score_id_min_heap_cmp> heap;
-
-    for (size_t slot = 0; slot < n_slots; ++slot) {
-        const float s = dot(query, idx.data.data() + slot * static_cast<size_t>(dim), dim);
-        if (heap.size() < static_cast<size_t>(k)) {
-            heap.push({ s, idx.slot_to_id[slot] });
-        } else if (s > heap.top().score) {
-            heap.pop();
-            heap.push({ s, idx.slot_to_id[slot] });
-        }
-    }
-
-    // Drain the heap into a temporary descending list.
-    std::vector<score_id> drained;
-    drained.reserve(heap.size());
-    while (!heap.empty()) {
-        drained.push_back(heap.top());
-        heap.pop();
-    }
-    std::reverse(drained.begin(), drained.end());  // now descending by score
-
-    for (int i = 0; i < k; ++i) {
-        if (static_cast<size_t>(i) < drained.size()) {
-            out_scores[i] = drained[i].score;
-            out_ids[i]    = drained[i].id;
-        } else {
-            out_scores[i] = -FLT_MAX;
-            out_ids[i]    = UINT64_MAX;
-        }
-    }
-}
-
-}  // namespace
-
-int ggml_vec_index_search(const ggml_vec_index_t * idx,
-                          const float *            queries,
-                          int                      n_q,
-                          int                      k,
-                          float *                  out_scores,
-                          uint64_t *               out_ids) {
+int ggml_vec_index_remove(ggml_vec_index_t * idx, uint64_t id) {
     if (idx == nullptr) {
         return GGML_VEC_INDEX_E_INVALID_ARG;
     }
-    if (n_q < 0 || k <= 0) {
-        return GGML_VEC_INDEX_E_INVALID_ARG;
-    }
-    if (n_q == 0) {
-        return GGML_VEC_INDEX_OK;
-    }
-    if (queries == nullptr || out_scores == nullptr || out_ids == nullptr) {
-        return GGML_VEC_INDEX_E_INVALID_ARG;
-    }
-
     try {
-        const int    dim    = idx->dim;
-        const size_t n_q_sz = static_cast<size_t>(n_q);
-        const size_t k_sz   = static_cast<size_t>(k);
-        const size_t dim_sz = static_cast<size_t>(dim);
-        if ((dim_sz != 0 && n_q_sz > std::numeric_limits<size_t>::max() / dim_sz) ||
-            n_q_sz > std::numeric_limits<size_t>::max() / k_sz) {
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
-        if (!all_finite(queries, n_q_sz * dim_sz)) {
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
-
-        for (int q = 0; q < n_q; ++q) {
-            search_one(*idx, queries + static_cast<size_t>(q) * static_cast<size_t>(dim), k,
-                       out_scores + static_cast<size_t>(q) * static_cast<size_t>(k),
-                       out_ids + static_cast<size_t>(q) * static_cast<size_t>(k));
-        }
-    } catch (const std::bad_alloc &) {
-        return GGML_VEC_INDEX_E_OOM;
-    } catch (...) {
-        return GGML_VEC_INDEX_E_INTERNAL;
-    }
-    return GGML_VEC_INDEX_OK;
-}
-
-// ---------------------------------------------------------------------------
-// Persistence
-// ---------------------------------------------------------------------------
-
-int ggml_vec_index_write(ggml_vec_index_t * idx, const char * path) {
-    try {
-        if (idx == nullptr || path == nullptr) {
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
-        if (idx->slot_to_id.size() > static_cast<size_t>(std::numeric_limits<int>::max()) ||
-            idx->slot_to_id.size() > std::numeric_limits<uint32_t>::max()) {
-            return GGML_VEC_INDEX_E_INVALID_ARG;
-        }
-        const size_t n      = idx->slot_to_id.size();
-        const size_t dim_sz = static_cast<size_t>(idx->dim);
-        if (dim_sz != 0 && n > std::numeric_limits<size_t>::max() / dim_sz) {
-            return GGML_VEC_INDEX_E_INTERNAL;
-        }
-        if (idx->data.size() != n * dim_sz) {
-            return GGML_VEC_INDEX_E_INTERNAL;
-        }
-
-        const std::filesystem::path dst_path(path);
-        const std::filesystem::path tmp_path = make_tmp_path(dst_path);
-
-        std::unique_ptr<std::FILE, decltype(&std::fclose)> f(open_exclusive(tmp_path), &std::fclose);
-        if (f == nullptr) {
-            return GGML_VEC_INDEX_E_IO;
-        }
-        tmp_file_guard tmp_guard(tmp_path);
-        const auto fail_io = [&]() {
-            f.reset();
-            return GGML_VEC_INDEX_E_IO;
-        };
-
-        // Header: 16 bytes. Layout matches the comment block in the header file.
-        uint8_t header[kTvimHeaderSize] = {};
-        std::memcpy(header, kTvimMagic, 4);
-        header[4]             = kTvimVersion;
-        header[5]             = static_cast<uint8_t>(idx->bit_width);
-        header[6]             = 0;
-        header[7]             = 0;
-        const uint32_t dim_le = static_cast<uint32_t>(idx->dim);
-        const uint32_t n_le   = static_cast<uint32_t>(idx->slot_to_id.size());
-        put_u32_le(header + 8, dim_le);
-        put_u32_le(header + 12, n_le);
-
-        if (std::fwrite(header, 1, sizeof(header), f.get()) != sizeof(header)) {
-            return fail_io();
-        }
-
-        for (float v : idx->data) {
-            if (!write_u32_le(f.get(), float_to_u32(v))) {
-                return fail_io();
-            }
-        }
-
-        for (uint64_t id : idx->slot_to_id) {
-            if (!write_u64_le(f.get(), id)) {
-                return fail_io();
-            }
-        }
-
-        if (std::fflush(f.get()) != 0) {
-            return fail_io();
-        }
-        std::FILE * raw_file = f.release();
-        if (std::fclose(raw_file) != 0) {
-            return GGML_VEC_INDEX_E_IO;
-        }
-
-        if (!copy_permissions_if_exists(dst_path, tmp_path)) {
-            return fail_io();
-        }
-
-        if (!replace_file(tmp_path, dst_path)) {
-            return GGML_VEC_INDEX_E_IO;
-        }
-        tmp_guard.dismiss();
-        return GGML_VEC_INDEX_OK;
-    } catch (const std::bad_alloc &) {
-        return GGML_VEC_INDEX_E_OOM;
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        return ggml_vec_index_remove_unlocked(idx, id);
     } catch (...) {
         return GGML_VEC_INDEX_E_INTERNAL;
     }
 }
 
-ggml_vec_index_t * ggml_vec_index_load(const char * path) {
+static int ggml_vec_index_compact_unlocked(ggml_vec_index_t * idx) {
     try {
-        if (path == nullptr) {
-            return nullptr;
-        }
-        std::ifstream f(path, std::ios::binary);
-        if (!f.is_open()) {
-            return nullptr;
-        }
-        std::error_code ec;
-        const uintmax_t file_size_um = std::filesystem::file_size(path, ec);
-        if (ec || file_size_um > static_cast<uintmax_t>(std::numeric_limits<size_t>::max())) {
-            return nullptr;
-        }
-        const size_t file_size = static_cast<size_t>(file_size_um);
-
-        uint8_t header[kTvimHeaderSize] = {};
-        f.read(reinterpret_cast<char *>(header), sizeof(header));
-        if (!f || f.gcount() != static_cast<std::streamsize>(sizeof(header))) {
-            return nullptr;
-        }
-        if (std::memcmp(header, kTvimMagic, 4) != 0) {
-            return nullptr;
-        }
-        if (header[4] != kTvimVersion) {
-            return nullptr;
-        }
-        if (header[6] != 0 || header[7] != 0) {
-            return nullptr;
-        }
-
-        const int      bit_width = static_cast<int>(header[5]);
-        const uint32_t dim_le    = get_u32_le(header + 8);
-        const uint32_t n_le      = get_u32_le(header + 12);
-        if (dim_le == 0 || dim_le > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
-            return nullptr;
-        }
-        if (n_le > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
-            return nullptr;
-        }
-        const int    dim           = static_cast<int>(dim_le);
-        const size_t dim_sz        = static_cast<size_t>(dim);
-        const size_t n             = static_cast<size_t>(n_le);
-        size_t       expected_size = 0;
-        if (!expected_snapshot_size(n, dim_sz, expected_size) || file_size != expected_size) {
-            return nullptr;
-        }
-
-        std::unique_ptr<ggml_vec_index_t, decltype(&ggml_vec_index_free)> idx(ggml_vec_index_create(dim, bit_width),
-                                                                              ggml_vec_index_free);
         if (idx == nullptr) {
-            return nullptr;
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (idx->read_only_mmap) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
         }
 
-        idx->data.resize(n * dim_sz);
-        idx->slot_to_id.resize(n);
-        idx->id_to_slot.reserve(n);
-
-        for (float & v : idx->data) {
-            uint32_t bits = 0;
-            if (!read_u32_le(f, bits)) {
-                return nullptr;
-            }
-            v = u32_to_float(bits);
-            if (!std::isfinite(v)) {
-                return nullptr;
-            }
+        const size_t n_slots = idx->slot_to_id.size();
+        const size_t n_live = active_count(*idx);
+        if (idx->delta_log_bound) {
+            return GGML_VEC_INDEX_E_INVALID_ARG;
+        }
+        if (n_live == n_slots) {
+            return GGML_VEC_INDEX_OK;
         }
 
-        for (uint64_t & id : idx->slot_to_id) {
-            if (!read_u64_le(f, id)) {
-                return nullptr;
-            }
+        const size_t dim_sz = static_cast<size_t>(idx->dim);
+        if (dim_sz != 0 && n_live > std::numeric_limits<size_t>::max() / dim_sz) {
+            return GGML_VEC_INDEX_E_INTERNAL;
         }
 
-        for (size_t slot = 0; slot < n; ++slot) {
-            const uint64_t id = idx->slot_to_id[slot];
-            if (id == kPaddingId) {
-                return nullptr;
+        test_maybe_throw_bad_alloc();
+        std::vector<uint64_t> new_slot_to_id;
+        std::vector<uint8_t> new_slot_active;
+        std::unordered_map<uint64_t, size_t> new_id_to_slot;
+        new_slot_to_id.reserve(n_live);
+        new_slot_active.assign(n_live, 1);
+        new_id_to_slot.reserve(n_live);
+
+        if (is_q4(*idx)) {
+            const size_t row_bytes = q4_row_bytes(dim_sz);
+            std::vector<uint8_t> new_q4_data;
+            std::vector<float> new_q4_scale;
+            new_q4_data.resize(n_live * row_bytes);
+            new_q4_scale.reserve(n_live);
+            for (size_t slot = 0; slot < n_slots; ++slot) {
+                if (!slot_is_active(*idx, slot)) {
+                    continue;
+                }
+                const size_t out_slot = new_slot_to_id.size();
+                std::memcpy(
+                    new_q4_data.data() + out_slot * row_bytes,
+                    idx->q4_data.data() + slot * row_bytes,
+                    row_bytes * sizeof(uint8_t));
+                new_q4_scale.push_back(idx->q4_scale[slot]);
+                new_slot_to_id.push_back(idx->slot_to_id[slot]);
+                new_id_to_slot.emplace(idx->slot_to_id[slot], out_slot);
             }
-            const bool inserted = idx->id_to_slot.emplace(id, slot).second;
-            if (!inserted) {
-                // Duplicate id in persisted file: corrupted.
-                return nullptr;
+            idx->q4_data.swap(new_q4_data);
+            idx->q4_scale.swap(new_q4_scale);
+        } else if (is_q8(*idx)) {
+            std::vector<int8_t> new_q8_data;
+            std::vector<float> new_q8_scale;
+            new_q8_data.resize(n_live * dim_sz);
+            new_q8_scale.reserve(n_live);
+            for (size_t slot = 0; slot < n_slots; ++slot) {
+                if (!slot_is_active(*idx, slot)) {
+                    continue;
+                }
+                const size_t out_slot = new_slot_to_id.size();
+                std::memcpy(
+                    new_q8_data.data() + out_slot * dim_sz,
+                    idx->q8_data.data() + slot * dim_sz,
+                    dim_sz * sizeof(int8_t));
+                new_q8_scale.push_back(idx->q8_scale[slot]);
+                new_slot_to_id.push_back(idx->slot_to_id[slot]);
+                new_id_to_slot.emplace(idx->slot_to_id[slot], out_slot);
             }
+            idx->q8_data.swap(new_q8_data);
+            idx->q8_scale.swap(new_q8_scale);
+        } else {
+            std::vector<float> new_data;
+            new_data.resize(n_live * dim_sz);
+            for (size_t slot = 0; slot < n_slots; ++slot) {
+                if (!slot_is_active(*idx, slot)) {
+                    continue;
+                }
+                const size_t out_slot = new_slot_to_id.size();
+                std::memcpy(
+                    new_data.data() + out_slot * dim_sz,
+                    idx->data.data() + slot * dim_sz,
+                    dim_sz * sizeof(float));
+                new_slot_to_id.push_back(idx->slot_to_id[slot]);
+                new_id_to_slot.emplace(idx->slot_to_id[slot], out_slot);
+            }
+            idx->data.swap(new_data);
         }
 
-        return idx.release();
+        idx->slot_to_id.swap(new_slot_to_id);
+        idx->slot_active.swap(new_slot_active);
+        idx->id_to_slot.swap(new_id_to_slot);
+        idx->n_active = idx->slot_to_id.size();
+        ++idx->generation;
+        invalidate_ivf(*idx);
+        idx->delta_log_start_allowed = false;
+        return GGML_VEC_INDEX_OK;
+    } catch (const std::bad_alloc &) {
+        return GGML_VEC_INDEX_E_OOM;
     } catch (...) {
-        return nullptr;
+        return GGML_VEC_INDEX_E_INTERNAL;
     }
+}
+
+int ggml_vec_index_compact(ggml_vec_index_t * idx) {
+    if (idx == nullptr) {
+        return GGML_VEC_INDEX_E_INVALID_ARG;
+    }
+    try {
+        std::unique_lock<std::shared_mutex> lock(idx->mutex);
+        return ggml_vec_index_compact_unlocked(idx);
+    } catch (...) {
+        return GGML_VEC_INDEX_E_INTERNAL;
+    }
+}
+
+int ggml_vec_index_add_logged(
+    ggml_vec_index_t *,
+    const float *,
+    int,
+    const uint64_t *,
+    const char *) {
+    return GGML_VEC_INDEX_E_INVALID_ARG;
+}
+
+int ggml_vec_index_remove_logged(
+    ggml_vec_index_t *,
+    uint64_t,
+    const char *) {
+    return GGML_VEC_INDEX_E_INVALID_ARG;
 }
 
 // ---------------------------------------------------------------------------
@@ -756,16 +620,35 @@ int ggml_vec_index_len(const ggml_vec_index_t * idx) {
     if (idx == nullptr) {
         return 0;
     }
-    if (idx->slot_to_id.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
-        return std::numeric_limits<int>::max();
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        const size_t n = active_count(*idx);
+        return n > kMaxIndexLen ? std::numeric_limits<int>::max() : static_cast<int>(n);
+    } catch (...) {
+        return 0;
     }
-    return static_cast<int>(idx->slot_to_id.size());
 }
 
 int ggml_vec_index_dim(const ggml_vec_index_t * idx) {
-    return idx ? idx->dim : 0;
+    if (idx == nullptr) {
+        return 0;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        return idx->dim;
+    } catch (...) {
+        return 0;
+    }
 }
 
 int ggml_vec_index_bit_width(const ggml_vec_index_t * idx) {
-    return idx ? idx->bit_width : 0;
+    if (idx == nullptr) {
+        return 0;
+    }
+    try {
+        std::shared_lock<std::shared_mutex> lock(idx->mutex);
+        return idx->bit_width;
+    } catch (...) {
+        return 0;
+    }
 }
