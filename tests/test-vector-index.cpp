@@ -100,6 +100,14 @@ void write_bytes(const std::filesystem::path & path, const std::vector<uint8_t> 
     CHECK(static_cast<bool>(f));
 }
 
+std::vector<uint8_t> read_bytes(const std::filesystem::path & path) {
+    std::ifstream f(path, std::ios::binary);
+    CHECK(f.is_open());
+    return std::vector<uint8_t>(
+        std::istreambuf_iterator<char>(f),
+        std::istreambuf_iterator<char>());
+}
+
 bool has_snapshot_tmp(const std::filesystem::path & path) {
     const std::filesystem::path dir    = path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
     const std::string           prefix = path.filename().string() + ".tmp.";
@@ -647,6 +655,42 @@ int main() {
         ggml_vec_index_free(search_idx);
     }
 
+    // v2 snapshots preserve quantized storage and can be loaded through mmap
+    // for read-only search.
+    {
+        temp_file q4_file(".tvim");
+        auto * q4_idx = ggml_vec_index_create(kDim, /*bit_width=*/4);
+        CHECK(q4_idx != nullptr);
+        CHECK(ggml_vec_index_add(q4_idx, vecs.data(), static_cast<int>(ids.size()), ids.data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(ggml_vec_index_write(q4_idx, q4_file.path.string().c_str()) == GGML_VEC_INDEX_OK);
+
+        auto * q4_loaded = ggml_vec_index_load(q4_file.path.string().c_str());
+        CHECK(q4_loaded != nullptr);
+        CHECK(ggml_vec_index_bit_width(q4_loaded) == 4);
+
+        auto * q4_mmap = ggml_vec_index_load_mmap(q4_file.path.string().c_str());
+        CHECK(q4_mmap != nullptr);
+        std::array<float, 1>    scores{};
+        std::array<uint64_t, 1> out_ids{};
+        CHECK(ggml_vec_index_search(q4_mmap, seeds[0].data(), 1, 1, scores.data(), out_ids.data()) ==
+              GGML_VEC_INDEX_OK);
+        CHECK(out_ids[0] == ids[0]);
+        CHECK(ggml_vec_index_add(q4_mmap, seeds[0].data(), 1, &ids[0]) == GGML_VEC_INDEX_E_INVALID_ARG);
+
+        std::vector<uint8_t> corrupt = read_bytes(q4_file.path);
+        CHECK(!corrupt.empty());
+        corrupt[corrupt.size() - 1] ^= 1;
+        temp_file corrupt_file(".tvim");
+        write_bytes(corrupt_file.path, corrupt);
+        CHECK(ggml_vec_index_load(corrupt_file.path.string().c_str()) == nullptr);
+        CHECK(ggml_vec_index_load_mmap(corrupt_file.path.string().c_str()) == nullptr);
+
+        ggml_vec_index_free(q4_mmap);
+        ggml_vec_index_free(q4_loaded);
+        ggml_vec_index_free(q4_idx);
+    }
+
     // Malformed snapshots are rejected before allocating from untrusted counts.
     {
         temp_file truncated_header(".tvim");
@@ -714,7 +758,10 @@ int main() {
             /*n=*/1, { 1.0f, 0.0f, 0.0f, 0.0f }, { 123ULL });
         bytes[5] = 8;
         write_bytes(bad_bit_width.path, bytes);
-        CHECK(ggml_vec_index_load(bad_bit_width.path.string().c_str()) == nullptr);
+        auto * legacy_q8 = ggml_vec_index_load(bad_bit_width.path.string().c_str());
+        CHECK(legacy_q8 != nullptr);
+        CHECK(ggml_vec_index_bit_width(legacy_q8) == 8);
+        ggml_vec_index_free(legacy_q8);
     }
     {
         temp_file            reserved_header(".tvim");

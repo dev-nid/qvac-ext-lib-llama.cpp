@@ -65,3 +65,13 @@ the same id set for repeated `ggml_vec_index_search_prepared_filtered` calls.
 `ggml_vec_index_build_ivf` builds heap-owned IVF-flat state for approximate
 candidate selection. Call it again after loading an index and after successful
 add/remove mutations. IVF state is not persisted in snapshots.
+
+## Persistence
+
+Snapshots use `.tvim`. Version 2 records the storage kind, ids, quantization
+scales, vector bytes, and checksums. The loader still accepts legacy v1 f32
+snapshots; legacy `bit_width=8` files are quantized to q8 on load.
+
+`ggml_vec_index_load_mmap` maps the vector section read-only and copies ids and
+scales into memory. mmap-loaded handles allow search and IVF preparation, but
+reject content mutations.
