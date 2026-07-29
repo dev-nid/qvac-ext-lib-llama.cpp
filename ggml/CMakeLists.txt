@@ -123,7 +123,6 @@ option(GGML_STATIC "ggml: static link libraries"                     OFF)
 option(GGML_NATIVE "ggml: optimize the build for the current system" ${GGML_NATIVE_DEFAULT})
 option(GGML_LTO    "ggml: enable link time optimization"             OFF)
 option(GGML_CCACHE "ggml: use ccache if available"                   ON)
-option(GGML_VECTOR_INDEX "ggml: build standalone vector index library" OFF)
 
 # debug
 option(GGML_ALL_WARNINGS           "ggml: enable all compiler warnings"                   ON)
@@ -188,6 +187,7 @@ set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 # ggml core
 set(GGML_SCHED_MAX_COPIES  "4" CACHE STRING "ggml: max input copies for pipeline parallelism")
 option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
+option(GGML_VECTOR_INDEX                    "ggml: build vector index library"                OFF)
 option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
 
 # 3rd party libs / backends
@@ -343,12 +343,22 @@ set(GGML_PUBLIC_HEADERS
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
+if (GGML_VECTOR_INDEX)
+    set_target_properties(ggml-vector-index PROPERTIES PUBLIC_HEADER include/ggml-vector-index.h)
+endif()
 #if (GGML_METAL)
 #    set_target_properties(ggml PROPERTIES RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/ggml-metal.metal")
 #endif()
+
+set(GGML_INSTALL_TARGETS ggml ggml-base)
+if (GGML_VECTOR_INDEX)
+    list(APPEND GGML_INSTALL_TARGETS ggml-vector-index)
+endif()
+
 install(
-  TARGETS ggml ggml-base
-  EXPORT ggml-targets)
+  TARGETS ${GGML_INSTALL_TARGETS}
+  EXPORT ggml-targets
+  PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 install(
   EXPORT ggml-targets
@@ -385,13 +395,21 @@ if (GGML_STANDALONE)
 endif()
 
 if (GGML_VECTOR_INDEX)
-    set(GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST "")
-    foreach(lib IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
-        if (lib STREQUAL "c++" OR lib STREQUAL "stdc++")
-            list(APPEND GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST "-l${lib}")
+    set(GGML_VECTOR_INDEX_PC_LIBS_PRIVATE "")
+    foreach(GGML_VECTOR_INDEX_PC_PRIVATE_LIB IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
+        if (GGML_VECTOR_INDEX_PC_PRIVATE_LIB MATCHES "^-")
+            list(APPEND GGML_VECTOR_INDEX_PC_LIBS_PRIVATE "${GGML_VECTOR_INDEX_PC_PRIVATE_LIB}")
+        elseif (IS_ABSOLUTE "${GGML_VECTOR_INDEX_PC_PRIVATE_LIB}")
+            list(APPEND GGML_VECTOR_INDEX_PC_LIBS_PRIVATE "${GGML_VECTOR_INDEX_PC_PRIVATE_LIB}")
+        else()
+            list(APPEND GGML_VECTOR_INDEX_PC_LIBS_PRIVATE "-l${GGML_VECTOR_INDEX_PC_PRIVATE_LIB}")
         endif()
     endforeach()
-    string(JOIN " " GGML_VECTOR_INDEX_PRIVATE_LIBS ${GGML_VECTOR_INDEX_PRIVATE_LIBS_LIST})
+    if (CMAKE_THREAD_LIBS_INIT)
+        list(APPEND GGML_VECTOR_INDEX_PC_LIBS_PRIVATE "${CMAKE_THREAD_LIBS_INIT}")
+    endif()
+    list(REMOVE_DUPLICATES GGML_VECTOR_INDEX_PC_LIBS_PRIVATE)
+    string(REPLACE ";" " " GGML_VECTOR_INDEX_PC_LIBS_PRIVATE "${GGML_VECTOR_INDEX_PC_LIBS_PRIVATE}")
 
     configure_file(${CMAKE_CURRENT_SOURCE_DIR}/ggml-vector-index.pc.in
         ${CMAKE_CURRENT_BINARY_DIR}/ggml-vector-index.pc

@@ -1,36 +1,35 @@
 # Vector Index
 
 `ggml-vector-index` is an opt-in C API for local vector search. It stores caller
-provided ids with dense vectors and exposes exact top-k search over f32, q8, and
-packed q4 storage.
+provided ids with dense vectors, supports exact and approximate top-k search,
+and can persist indexes to disk.
 
-This candidate component is currently standalone. It is not enabled in default
-builds and is not wired into the llama runtime, server, or app paths. Consumers
-should enable it explicitly and link the vector-index target directly.
+This experimental component is currently standalone. It is not enabled in
+default builds and is not wired into the llama runtime, server, or app paths.
+Consumers should enable it explicitly and link the vector-index target directly.
 
-## How The Pieces Fit
+## How the pieces fit
 
-The public API owns an opaque index handle, caller ids, storage slots, and the
-exact top-k baseline used to check later search modes. Storage starts with f32
-for correctness, then q8 and packed q4 trade precision for smaller CPU-resident
-rows while keeping the query path in f32.
+The public API owns the opaque handle, caller ids, storage slots, and exact
+top-k baseline. f32 storage is the correctness path; q8 and packed q4 keep CPU
+rows smaller while scoring f32 queries against quantized codes.
 
-Search layers build upward from exact scan: filtered search limits candidates by
-id, prepared filters reuse that id-to-slot mapping, and IVF-flat adds an
-in-memory candidate selector. Persistence is layered separately: `.tvim` full
-snapshots can be loaded normally or mmap-backed for read-only search, and
-`.tvid` logs replay or compact mutations on top of a snapshot. TurboVec then
-adds the q2/q4 path: rotation, TQ+ calibration, codebooks, bit-plane storage,
-LUT scoring, and blocked SIMD cache state. Tests cover each layer where it
-lands, with fault and cross-process checks reserved for durable persistence.
+Search builds on that baseline. Filters restrict exact search to an id set,
+prepared filters cache the id-to-slot mapping, and IVF-flat adds in-memory
+candidate selection. Persistence is separate: `.tvim` stores full snapshots,
+mmap opens snapshot vectors read-only, and `.tvid` replays or compacts logged
+mutations on top. TurboVec extends the same index with rotation, TQ+
+calibration, q2/q4 codebooks, bit-plane storage, LUT scoring, and blocked SIMD
+cache state. Tests are grouped with the layer they cover, including corruption,
+fault-injection, cross-process locking, package smoke, and benchmark checks.
 
 ## Build
 
 Enable the library with `GGML_VECTOR_INDEX`:
 
 ```sh
-cmake -B build -DGGML_VECTOR_INDEX=ON -DLLAMA_BUILD_TESTS=ON
-cmake --build build --target ggml-vector-index test-vector-index
+cmake -B build -DGGML_VECTOR_INDEX=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=ON
+cmake --build build --target ggml-vector-index test-vector-index bench-vector-index
 ```
 
 Installed CMake packages export the target as `ggml::vector-index`.
@@ -56,22 +55,159 @@ Search scores are dot products. The index does not normalize vectors internally.
 For cosine similarity, normalize vectors before insertion and normalize queries
 before search.
 
+## Basic Usage
+
+```c
+#include "ggml-vector-index.h"
+
+#include <stdint.h>
+#include <stdio.h>
+
+int main(void) {
+    const int dim = 4;
+    const float vectors[] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+    };
+    const uint64_t ids[] = { 101, 102 };
+    const float query[] = { 0.8f, 0.2f, 0.0f, 0.0f };
+    float scores[2];
+    uint64_t out_ids[2];
+
+    ggml_vec_index_t * idx = ggml_vec_index_create(dim, 32);
+    if (idx == NULL) {
+        return 1;
+    }
+
+    int rc = ggml_vec_index_add(idx, vectors, 2, ids);
+    if (rc != GGML_VEC_INDEX_OK) {
+        fprintf(stderr, "add failed: %s\n", ggml_vec_index_error_to_string(rc));
+        ggml_vec_index_free(idx);
+        return 1;
+    }
+
+    rc = ggml_vec_index_search(idx, query, 1, 2, scores, out_ids);
+    if (rc == GGML_VEC_INDEX_OK) {
+        printf("best id=%llu score=%f\n",
+            (unsigned long long) out_ids[0],
+            scores[0]);
+    }
+
+    ggml_vec_index_free(idx);
+    return rc == GGML_VEC_INDEX_OK ? 0 : 1;
+}
+```
+
+`ggml_vec_index_search` fills each result row in descending score order, with
+equal scores ordered by ascending id. If fewer than `k` live entries are
+available, padded ids are set to `UINT64_MAX`.
+
 ## Search Modes
 
-Exact search scans all live slots. `ggml_vec_index_search_filtered` restricts
-that scan to caller-provided ids, and `ggml_vec_index_filter_create` prepares
-the same id set for repeated `ggml_vec_index_search_prepared_filtered` calls.
+Exact search scans all live entries:
 
-`ggml_vec_index_build_ivf` builds heap-owned IVF-flat state for approximate
-candidate selection. Call it again after loading an index and after successful
-add/remove mutations. IVF state is not persisted in snapshots.
+- `ggml_vec_index_search`
+- `ggml_vec_index_search_filtered`
+- `ggml_vec_index_filter_create`
+- `ggml_vec_index_search_prepared_filtered`
+
+IVF-flat search builds heap-owned approximate-nearest-neighbor state:
+
+- `ggml_vec_index_build_ivf`
+- `ggml_vec_index_search_ivf`
+
+`ggml_vec_index_prepare` remains as a compatibility no-op. New callers should
+use `ggml_vec_index_build_ivf` when approximate-search preparation is needed.
+
+Call `ggml_vec_index_build_ivf` after loading an index and after successful
+add/remove mutations. IVF state is not persisted in `.tvim` snapshots. Higher
+`nprobe` values search more lists and generally improve recall at higher cost.
+IVF uses the same dot-product score as exact search, assigning vectors and
+queries to arithmetic centroids with dot-product scoring. Low `nprobe` values
+are a recall/latency heuristic; probing all built lists gives exact-search
+candidate coverage. For cosine-like IVF behavior, normalize vectors before
+insertion and normalize queries before search.
 
 ## Persistence
 
-Snapshots use `.tvim`. Version 2 records the storage kind, ids, quantization
-scales, vector bytes, and checksums. The loader still accepts legacy v1 f32
-snapshots; legacy `bit_width=8` files are quantized to q8 on load.
+Snapshots use the `.tvim` format. Delta logs use `.tvid`.
 
-`ggml_vec_index_load_mmap` maps the vector section read-only and copies ids and
-scales into memory. mmap-loaded handles allow search and IVF preparation, but
-reject content mutations.
+- `ggml_vec_index_write` writes a full snapshot.
+- `ggml_vec_index_load` loads a snapshot into memory.
+- `ggml_vec_index_add_logged` and `ggml_vec_index_remove_logged` apply mutations
+  and append replayable delta records.
+- `ggml_vec_index_load_with_delta` loads a snapshot and replays a delta log.
+- `ggml_vec_index_compact_delta` writes a new snapshot and replaces the delta
+  log with an empty matching log.
+
+Delta logs are bound to the state of the snapshot they extend. Use one evolving
+writer handle for a given snapshot and delta path pair. If another handle or
+process writes to the same log, stale writers must reload from snapshot plus
+delta before appending again. Loading validates each replayed record against
+its stored post-state identity.
+
+Cross-process append protection uses cooperative OS file locks. Keep `.tvid`
+delta logs on local filesystems with reliable locking, and do not edit or append
+to them outside the vector-index API.
+
+After a handle has been loaded with a delta log or has used logged mutations,
+content changes must continue through `ggml_vec_index_add_logged`,
+`ggml_vec_index_remove_logged`, or `ggml_vec_index_compact_delta`. Plain
+add/remove/compact/write calls are rejected on delta-bound handles.
+
+Readers still accept legacy v1/v2 delta logs. New q4/q8 adds are not appended
+to those f32-payload log formats; compact first so subsequent quantized adds use
+native-code v4 records.
+
+## mmap Loading
+
+`ggml_vec_index_load_mmap` loads a v2 snapshot with the vector section mapped
+read-only. Ids and quantization scales are copied into memory.
+
+On mmap-backed handles:
+
+- Search APIs are allowed.
+- `ggml_vec_index_build_ivf` is allowed because it only builds heap-owned search
+  state.
+- Index-content mutations such as add, remove, compact, and logged mutations
+  return `GGML_VEC_INDEX_E_INVALID_ARG`.
+- `ggml_vec_index_write` is allowed only when writing to a path different from
+  the mapped source file.
+- `ggml_vec_index_compact_delta` is allowed when writing the compacted snapshot
+  to a path different from the mapped source file; it rebuilds the state identity
+  before replacing the delta log.
+
+The mmap loader is snapshot-only and does not replay `.tvid` delta logs. Use
+`ggml_vec_index_load_with_delta` when delta replay is needed.
+
+The persisted formats are little-endian. Regular load paths decode fields into
+host values; mmap loading requires a little-endian host because vector bytes are
+read directly from the mapped file.
+
+## Threading
+
+Read-only APIs on the same handle can run concurrently. Mutations, persistence
+writes, compaction, and IVF builds are serialized with reads and with each
+other. The caller must keep index and prepared-filter handles alive for the full
+duration of every API call that uses them.
+
+## Tests and Benchmark
+
+Run the regression tests:
+
+```sh
+cmake --build build --target test-vector-index test-vector-index-faults
+./build/bin/test-vector-index
+./build/bin/test-vector-index-faults
+```
+
+Run the synthetic benchmark:
+
+```sh
+cmake --build build --target bench-vector-index
+./build/bin/bench-vector-index
+```
+
+The benchmark reports q8/q4 quality against f32 exact search, exact and IVF
+latency, mmap load timing, delta replay/compaction timing, and delete-heavy
+behavior.
